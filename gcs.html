@@ -1,0 +1,1009 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GCS 地面站</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg: #1a1d23; --panel-bg: #21252b; --border: #333842;
+  --text: #e0e0e0; --muted: #888; --accent: #4da6ff; --danger: #e0556a;
+  --success: #4ec958; --warn: #e5c04b;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+}
+body { background: var(--bg); color: var(--text); height: 100vh; overflow: hidden; }
+#app { display: flex; height: 100vh; }
+.panel { background: var(--panel-bg); border-right: 1px solid var(--border); overflow-y: auto; }
+.panel h3 { padding: 10px 12px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--muted); border-bottom: 1px solid var(--border); }
+
+/* Left panel */
+#left-panel { width: 280px; min-width: 280px; display: flex; flex-direction: column; }
+.section { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.section label { display: block; font-size: 11px; color: var(--muted); margin: 6px 0 2px; }
+.section select, .section input { width: 100%; padding: 5px 8px; background: var(--bg);
+  color: var(--text); border: 1px solid var(--border); border-radius: 3px; font-size: 12px; }
+.btn { padding: 6px 12px; border: 1px solid var(--border); border-radius: 3px; cursor: pointer;
+  font-size: 12px; color: var(--text); background: var(--bg); }
+.btn:hover { opacity: 0.85; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+.btn-success { background: var(--success); border-color: var(--success); color: #fff; }
+.btn-group { display: flex; gap: 4px; margin-top: 8px; flex-wrap: wrap; }
+.btn-group .btn { flex: 1; min-width: 60px; }
+
+/* Radio group */
+.radio-group { display: flex; gap: 8px; margin: 4px 0; }
+.radio-group label { font-size: 12px; cursor: pointer; display: flex; align-items: center; gap: 3px; }
+
+/* Center */
+#center-panel { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#map-container { flex: 1; position: relative; background: #111; }
+#ned-canvas { width: 100%; height: 100%; display: block; }
+#leaflet-map { width: 100%; height: 100%; display: none; }
+
+/* Telemetry bar */
+#telemetry-bar { display: flex; gap: 8px; padding: 6px 12px; background: var(--panel-bg);
+  border-top: 1px solid var(--border); font-size: 11px; flex-wrap: wrap;
+  font-family: 'Consolas', 'Courier New', monospace; }
+.telem-item { padding: 2px 8px; background: var(--bg); border-radius: 3px; white-space: nowrap; }
+.telem-item .val { color: var(--accent); font-weight: bold; }
+
+/* Right panel */
+#right-panel { width: 280px; min-width: 280px; display: flex; flex-direction: column; }
+#wp-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+#wp-table th { font-size: 10px; color: var(--muted); text-align: left; padding: 4px 6px;
+  background: var(--bg); position: sticky; top: 0; }
+#wp-table td { padding: 2px 4px; border-bottom: 1px solid var(--border); }
+#wp-table input { width: 100%; padding: 3px 4px; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 2px; font-size: 11px; font-family: 'Consolas', monospace; }
+#wp-table .del-btn { background: none; border: none; color: var(--danger); cursor: pointer; font-size: 14px; }
+
+.status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 3px; }
+.status-dot.on { background: var(--success); }
+.status-dot.off { background: var(--danger); }
+</style>
+</head>
+<body>
+
+<div id="app">
+  <!-- LEFT PANEL -->
+  <div id="left-panel" class="panel">
+    <h3>连接配置</h3>
+    <div class="section" id="conn-section">
+      <div class="radio-group" id="conn-type-group">
+        <label><input type="radio" name="conn-type" value="serial" checked> 串口</label>
+        <label><input type="radio" name="conn-type" value="udp"> WiFi UDP</label>
+        <label><input type="radio" name="conn-type" value="sitl"> SITL</label>
+      </div>
+      <div id="serial-args">
+        <label>端口</label><select id="serial-port"><option>/dev/ttyUSB0</option><option>/dev/ttyACM0</option><option>COM3</option><option>COM11</option></select>
+        <label>波特率</label><select id="serial-baud"><option>57600</option><option>115200</option><option>921600</option><option>19200</option><option>9600</option></select>
+      </div>
+      <div id="udp-args" style="display:none;">
+        <label>主机</label><input id="udp-host" value="192.168.1.100">
+        <label>端口</label><input id="udp-port" value="14550" type="number">
+      </div>
+      <div class="btn-group">
+        <button class="btn btn-primary" id="btn-connect">连接</button>
+        <button class="btn btn-danger" id="btn-disconnect">断开</button>
+      </div>
+      <div style="margin-top:6px;font-size:11px;"><span id="conn-status-dot" class="status-dot off"></span> <span id="conn-status-text">未连接</span></div>
+    </div>
+
+    <h3>定位模式</h3>
+    <div class="section">
+      <div class="radio-group">
+        <label><input type="radio" name="loc-mode" id="mode-indoor" checked> 室内 (UWB)</label>
+        <label><input type="radio" name="loc-mode" id="mode-outdoor"> 室外 (GPS)</label>
+      </div>
+      <label style="margin-top:6px;">地图源 (室外)</label>
+      <select id="tile-source" style="width:100%;">
+        <option value="gaode" selected>高德地图</option>
+        <option value="gaode_sat">高德卫星</option>
+        <option value="bing_sat">必应卫星</option>
+        <option value="google_sat">谷歌卫星</option>
+        <option value="google_hyb">谷歌混合</option>
+        <option value="tencent">腾讯地图</option>
+        <option value="osm">OSM (国外)</option>
+      </select>
+    </div>
+
+    <h3>飞行控制</h3>
+    <div class="section">
+      <label>飞行模式</label>
+      <select id="flight-mode"><option>GUIDED</option><option>AUTO</option><option>LOITER</option><option>RTL</option><option>LAND</option><option>STABILIZE</option></select>
+      <button class="btn" id="btn-set-mode" style="margin-top:4px;width:100%;">切换模式</button>
+      <div class="btn-group">
+        <button class="btn btn-success" id="btn-arm">解锁</button>
+        <button class="btn btn-danger" id="btn-disarm">上锁</button>
+      </div>
+      <div class="btn-group">
+        <button class="btn" id="btn-takeoff">起飞</button>
+        <button class="btn" id="btn-land">降落</button>
+        <button class="btn" id="btn-rtl">RTL</button>
+      </div>
+      <label>起飞高度 (m)</label><input id="takeoff-alt" value="3.0" type="number" step="0.5">
+    </div>
+  </div>
+
+  <!-- CENTER PANEL -->
+  <div id="center-panel">
+    <div id="map-container">
+      <canvas id="ned-canvas"></canvas>
+      <div id="leaflet-map"></div>
+      <button id="btn-follow" title="自动跟随无人机" style="position:absolute;top:8px;right:8px;z-index:1000;
+        background:var(--accent);color:#000;border:none;border-radius:4px;padding:4px 10px;
+        font-size:12px;cursor:pointer;font-weight:700;">跟随 ON</button>
+    </div>
+    <div id="telemetry-bar">
+      <div class="telem-item">&#x1F4CF; 高度 <span class="val" id="t-alt">--</span>m</div>
+      <div class="telem-item">&#x26A1; 速度 <span class="val" id="t-speed">--</span>m/s</div>
+      <div class="telem-item">&#x1F9ED; 航向 <span class="val" id="t-heading">--</span>&deg;</div>
+      <div class="telem-item"><span class="status-dot off" id="t-mode-dot"></span> <span class="val" id="t-mode">--</span></div>
+      <div class="telem-item">&#x1F50B; <span class="val" id="t-bat">--</span>V <span class="val" id="t-batpct">--</span>%</div>
+      <div class="telem-item" id="t-gps-item">&#x1F6F0; <span class="val" id="t-sats">--</span> | HDOP <span class="val" id="t-hdop">--</span></div>
+      <div class="telem-item">&#x1F4CD; <span class="val" id="t-pos">--</span></div>
+      <div class="telem-item">&#x1F3AF; <span class="val" id="t-target">--</span></div>
+    </div>
+  </div>
+
+  <!-- RIGHT PANEL -->
+  <div id="right-panel" class="panel">
+    <h3>航点列表</h3>
+    <div class="section" style="overflow-y:auto;flex:1;">
+      <table id="wp-table">
+        <thead><tr id="wp-table-head"><th>#</th><th>X(m)</th><th>Y(m)</th><th>Z(m)</th><th>悬停(s)</th><th>朝向(&deg;)</th><th></th></tr></thead>
+        <tbody id="wp-tbody"></tbody>
+      </table>
+      <div class="btn-group" style="margin-top:6px;">
+        <button class="btn" id="btn-add-wp">+ 添加</button>
+        <button class="btn btn-danger" id="btn-clear-wp">清空</button>
+      </div>
+    </div>
+
+    <h3>任务控制</h3>
+    <div class="section">
+      <div class="btn-group">
+        <button class="btn btn-primary" id="btn-upload">上传飞控</button>
+        <button class="btn btn-primary" id="btn-mission-start">开始任务</button>
+      </div>
+      <div class="btn-group">
+        <button class="btn" id="btn-step-by-step">逐步执行</button>
+        <button class="btn btn-danger" id="btn-mission-pause">暂停</button>
+      </div>
+      <div style="margin-top:6px;font-size:11px;" id="mission-status"></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// ============== WebSocket ==============
+var WS_HOST = location.hostname || "localhost";
+const WS_URL = "ws://" + WS_HOST + ":8765";
+var ws = null;
+var wsConnected = false;
+var wsReconnectTimer = null;
+
+function wsConnect() {
+  if (ws) {
+    try { ws.close(); } catch(e) {}
+  }
+  logStatus("正在连接桥接进程...", "info");
+  try {
+    ws = new WebSocket(WS_URL);
+  } catch(e) {
+    logStatus("无法创建 WebSocket: " + e.message, "error");
+    scheduleReconnect();
+    return;
+  }
+  ws.onopen = function() {
+    wsConnected = true;
+    if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+    updateConnUI(true);
+    logStatus("桥接进程已连接 - 请选择连接方式并点击连接飞控", "info");
+    wsSend("ping");
+    wsSend("get_config");  // Load UWB anchor positions dynamically
+  };
+  ws.onclose = function(e) {
+    wsConnected = false;
+    mavConnected = false;
+    updateConnUI(false);
+    logStatus("桥接进程断开 (code=" + e.code + ")", "warn");
+    scheduleReconnect();
+  };
+  ws.onerror = function(e) {
+    logStatus("WebSocket 连接失败 - 请确认 python gcs_bridge.py 已启动", "error");
+  };
+  ws.onmessage = function(e) {
+    try {
+      var msg = JSON.parse(e.data);
+      handleMessage(msg);
+    } catch(err) {}
+  };
+}
+
+function scheduleReconnect() {
+  if (wsReconnectTimer) return;
+  logStatus("3秒后自动重连...", "warn");
+  wsReconnectTimer = setTimeout(function() {
+    wsReconnectTimer = null;
+    wsConnect();
+  }, 3000);
+}
+
+function wsSend(cmd, data) {
+  data = data || {};
+  if (!ws || !wsConnected) { logStatus("未连接", "warn"); return false; }
+  data.cmd = cmd;
+  ws.send(JSON.stringify(data));
+  return true;
+}
+
+var mavConnected = false;
+
+function updateConnUI(connected) {
+  var dot = document.getElementById("conn-status-dot");
+  var txt = document.getElementById("conn-status-text");
+  if (connected && mavConnected) {
+    dot.className = "status-dot on"; txt.textContent = "飞控在线";
+  } else if (connected) {
+    dot.className = "status-dot on"; txt.textContent = "桥接就绪 - 点击连接飞控";
+  } else {
+    dot.className = "status-dot off"; txt.textContent = "桥接未启动 (python gcs_bridge.py)";
+  }
+}
+
+// ============== Connection handlers ==============
+document.getElementById("btn-connect").onclick = function() {
+  var connType = document.querySelector("input[name='conn-type']:checked").value;
+  var params = { type: connType };
+  if (connType === "serial") {
+    params.port = document.getElementById("serial-port").value;
+    params.baud = parseInt(document.getElementById("serial-baud").value);
+  } else if (connType === "udp") {
+    params.host = document.getElementById("udp-host").value;
+    params.port = parseInt(document.getElementById("udp-port").value);
+  }
+  wsSend("connect", params);
+};
+
+document.getElementById("btn-disconnect").onclick = function() { wsSend("disconnect"); };
+
+// Toggle serial/udp args visibility
+document.querySelectorAll("input[name='conn-type']").forEach(function(r) {
+  r.onchange = function() {
+    document.getElementById("serial-args").style.display = r.value === "serial" ? "" : "none";
+    document.getElementById("udp-args").style.display = r.value === "udp" ? "" : "none";
+  };
+});
+
+// ============== Indoor/Outdoor switch ==============
+document.getElementById("mode-indoor").onchange = function() { switchMapMode("indoor"); };
+document.getElementById("mode-outdoor").onchange = function() { switchMapMode("outdoor"); };
+document.getElementById("tile-source").onchange = function() {
+  setTileSource(this.value);
+};
+
+function switchMapMode(mode) {
+  var canvas = document.getElementById("ned-canvas");
+  var lmap = document.getElementById("leaflet-map");
+  if (mode === "indoor") {
+    canvas.style.display = "block"; lmap.style.display = "none";
+    document.getElementById("wp-table-head").innerHTML = "<th>#</th><th>X(m)</th><th>Y(m)</th><th>Z(m)</th><th>悬停(s)</th><th>朝向(&deg;)</th><th></th>";
+  } else {
+    canvas.style.display = "none"; lmap.style.display = "block";
+    document.getElementById("wp-table-head").innerHTML = "<th>#</th><th>纬度</th><th>经度</th><th>高度(m)</th><th>悬停(s)</th><th>朝向(&deg;)</th><th></th>";
+    if (!leafletInited) { initLeaflet(); leafletInited = true; }
+    setTimeout(function() {
+      if (leafletMap) { leafletMap.invalidateSize(); setTileSource(currentTileKey); }
+    }, 200);
+  }
+  rebuildWpTable();
+  refreshMapDraw();
+  wsSend("set_param", { indoor_mode: mode === "indoor" });
+}
+
+// ============== Flight controls ==============
+document.getElementById("btn-set-mode").onclick = function() {
+  wsSend("set_mode", { mode: document.getElementById("flight-mode").value });
+};
+document.getElementById("btn-arm").onclick = function() { wsSend("arm"); };
+document.getElementById("btn-disarm").onclick = function() { wsSend("disarm"); };
+document.getElementById("btn-takeoff").onclick = function() {
+  wsSend("takeoff", { alt: parseFloat(document.getElementById("takeoff-alt").value) });
+};
+document.getElementById("btn-land").onclick = function() { wsSend("land"); };
+document.getElementById("btn-rtl").onclick = function() { wsSend("set_mode", { mode: "RTL" }); };
+
+// ============== Utilities ==============
+function logStatus(msg, level) {
+  level = level || "info";
+  var el = document.getElementById("mission-status");
+  var colors = { info: "var(--accent)", warn: "var(--warn)", error: "var(--danger)" };
+  el.innerHTML = "<span style=\"color:" + (colors[level] || colors.info) + "\">" + msg + "</span>";
+  console.log("[GCS] " + msg);
+}
+
+// ============== Drone position ==============
+var droneNED = { x: 0, y: 0, z: -3, heading: 0, homeLat: 32.1148, homeLon: 118.959 };
+
+// Flight trail — past positions with timestamps, cleared after TRAIL_TTL seconds
+var TRAIL_TTL = 120; // 2 minutes in seconds
+var nedTrail = [];   // [{x, y, t}, ...]
+var gpsTrail = [];   // [{lat, lon, t}, ...]
+var leafletTrailLine = null;
+
+function updateDronePositionFull(x, y, z, heading, homeLat, homeLon, lat, lon) {
+  droneNED = { x: x || 0, y: y || 0, z: (z != null ? z : -3), heading: heading || 0,
+               homeLat: homeLat || 32.1148, homeLon: homeLon || 118.959,
+               lat: lat, lon: lon };
+  // Update reference point from telemetry
+  if (homeLat) REF_LAT = homeLat;
+  if (homeLon) REF_LON = homeLon;
+
+  var now = Date.now() / 1000;
+  nedTrail.push({ x: (x || 0), y: (y || 0), t: now });
+  gpsTrail.push({ lat: lat || REF_LAT, lon: lon || REF_LON, t: now });
+
+  updateDroneView();
+  if (document.getElementById("mode-indoor").checked) {
+    redrawNEDCanvas();
+  } else {
+    updateLeafletMarker();
+    redrawLeafletTrail();
+  }
+}
+
+// Purge trail points older than TRAIL_TTL
+function purgeTrail() {
+  var cutoff = Date.now() / 1000 - TRAIL_TTL;
+  while (nedTrail.length > 0 && nedTrail[0].t < cutoff) nedTrail.shift();
+  while (gpsTrail.length > 0 && gpsTrail[0].t < cutoff) gpsTrail.shift();
+}
+
+// Periodic trail cleanup
+setInterval(function() {
+  var before = nedTrail.length;
+  purgeTrail();
+  if (nedTrail.length !== before || gpsTrail.length !== before) {
+    if (document.getElementById("mode-indoor").checked) redrawNEDCanvas();
+    else redrawLeafletTrail();
+  }
+}, 10000);
+
+// ============== Telemetry bar ==============
+function updateTelemetry(t) {
+  document.getElementById("t-alt").textContent = t.alt != null ? t.alt.toFixed(1) : "--";
+  var speed = t.vx != null ? Math.sqrt((t.vx||0)*(t.vx||0) + (t.vy||0)*(t.vy||0) + (t.vz||0)*(t.vz||0)).toFixed(1) : "--";
+  document.getElementById("t-speed").textContent = speed;
+  document.getElementById("t-heading").textContent = t.heading != null ? t.heading.toFixed(0) : "--";
+
+  document.getElementById("t-mode").textContent = t.mode || "--";
+  var dot = document.getElementById("t-mode-dot");
+  dot.className = "status-dot " + (t.armed ? "on" : "off");
+
+  document.getElementById("t-bat").textContent = t.battery_voltage ? t.battery_voltage.toFixed(1) : "--";
+  document.getElementById("t-batpct").textContent = t.battery_percent != null ? t.battery_percent : "--";
+
+  document.getElementById("t-sats").textContent = t.satellites != null ? t.satellites : "--";
+  document.getElementById("t-hdop").textContent = t.hdop != null ? t.hdop.toFixed(1) : "--";
+
+  var indoor = document.getElementById("mode-indoor").checked;
+  if (indoor && t.ned_x != null) {
+    document.getElementById("t-pos").textContent = "NED(" + t.ned_x.toFixed(2) + ", " + t.ned_y.toFixed(2) + ", " + (t.ned_z ? t.ned_z.toFixed(2) : "0.00") + ")";
+  } else if (!indoor && t.lat != null) {
+    document.getElementById("t-pos").textContent = t.lat.toFixed(6) + ", " + t.lon.toFixed(6);
+  } else {
+    document.getElementById("t-pos").textContent = "--";
+  }
+
+  if (t.mission_total != null && t.mission_total > 0) {
+    document.getElementById("t-target").textContent = "WP" + ((t.mission_seq||0)+1) + "/" + t.mission_total;
+  } else {
+    document.getElementById("t-target").textContent = "--";
+  }
+
+  if (t.ned_x != null && t.ned_y != null) {
+    updateDronePositionFull(t.ned_x, t.ned_y, t.ned_z, t.heading, t.home_lat, t.home_lon, t.lat, t.lon);
+  }
+}
+
+// ============== NED Canvas ==============
+var nedScale = 60;
+var nedOffsetX = 0;
+var nedOffsetY = 0;
+var followDrone = true;
+var ANCHOR_COLOR = "rgba(77,166,255,0.2)";
+
+var btnFollow = document.getElementById("btn-follow");
+btnFollow.onclick = function () {
+  followDrone = !followDrone;
+  btnFollow.textContent = followDrone ? "跟随 ON" : "跟随 OFF";
+  btnFollow.style.background = followDrone ? "var(--accent)" : "#555";
+  if (followDrone) {
+    if (document.getElementById("mode-indoor").checked) {
+      nedOffsetX = -droneNED.y; nedOffsetY = -droneNED.x;
+    }
+    updateDroneView();
+  }
+};
+
+function updateDroneView() {
+  if (!followDrone) return;
+  if (document.getElementById("mode-indoor").checked) {
+    nedOffsetX = -droneNED.y;
+    nedOffsetY = -droneNED.x;
+  } else if (leafletMap) {
+    var lat = droneNED.lat || (REF_LAT + droneNED.y / 111320.0);
+    var lon = droneNED.lon || (REF_LON + droneNED.x / (111320.0 * Math.cos(REF_LAT * Math.PI / 180)));
+    leafletMap.panTo([lat, lon], { animate: true, duration: 0.3 });
+  }
+}
+
+// Anchor positions — loaded dynamically from UWB/uwb_config.json via bridge.
+// Fallback defaults shown until bridge responds with actual config.
+var anchors = [];
+
+function redrawNEDCanvas() {
+  var canvas = document.getElementById("ned-canvas");
+  if (!canvas || canvas.style.display === "none") return;
+  var container = document.getElementById("map-container");
+  canvas.width = container.clientWidth;
+  canvas.height = container.clientHeight;
+  var ctx = canvas.getContext("2d");
+  var w = canvas.width, h = canvas.height;
+
+  var cx = w / 2 + nedOffsetX * nedScale;
+  var cy = h / 2 - nedOffsetY * nedScale;
+
+  // Background
+  ctx.fillStyle = "#111";
+  ctx.fillRect(0, 0, w, h);
+
+  // Grid lines
+  ctx.strokeStyle = "#222";
+  ctx.lineWidth = 0.5;
+  var gridSpacing = nedScale;
+  var nx = cx % gridSpacing;
+  while (nx < w) { ctx.beginPath(); ctx.moveTo(nx, 0); ctx.lineTo(nx, h); ctx.stroke(); nx += gridSpacing; }
+  var ny = cy % gridSpacing;
+  while (ny < h) { ctx.beginPath(); ctx.moveTo(0, ny); ctx.lineTo(w, ny); ctx.stroke(); ny += gridSpacing; }
+
+  // Axes
+  ctx.strokeStyle = "#444";
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, h); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(w, cy); ctx.stroke();
+
+  // Axis labels
+  ctx.fillStyle = "#666"; ctx.font = "10px Consolas, monospace";
+  ctx.fillText("N↑", cx + 4, 14);
+  ctx.fillText("E→", w - 22, cy - 4);
+  ctx.fillText("0", cx + 4, cy - 4);
+
+  // Tick labels every 5m
+  ctx.fillStyle = "#555";
+  for (var m = -50; m <= 50; m += 5) {
+    if (m === 0) continue;
+    var px = cx + m * nedScale;
+    var py = cy - m * nedScale;
+    if (px > 10 && px < w - 10) ctx.fillText("" + m, px + 2, cy + 12);
+    if (py > 10 && py < h - 10) ctx.fillText("" + m, cx + 2, py - 2);
+  }
+
+  // Anchor markers
+  for (var ai = 0; ai < anchors.length; ai++) {
+    var a = anchors[ai];
+    var ax = cx + a.y * nedScale;
+    var ay = cy - a.x * nedScale;
+    ctx.fillStyle = ANCHOR_COLOR;
+    ctx.beginPath(); ctx.arc(ax, ay, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#888";
+    ctx.font = "9px Consolas"; ctx.fillText(a.id, ax + 8, ay + 4);
+  }
+
+  // Home marker
+  ctx.fillStyle = "#4ec958";
+  ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 10px Consolas"; ctx.fillText("H", cx + nedOffsetX * nedScale + 7, cy - nedOffsetY * nedScale + 4);
+
+  // Waypoint lines
+  var wpts = getWaypointsFromTable();
+  if (wpts.length > 0) {
+    ctx.strokeStyle = "#4da6ff";
+    ctx.lineWidth = 1.5; ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    for (var wi = 0; wi < wpts.length; wi++) {
+      var wx = cx + wpts[wi].y * nedScale;
+      var wy = cy - wpts[wi].x * nedScale;
+      if (wi === 0) ctx.moveTo(wx, wy); else ctx.lineTo(wx, wy);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    for (var wj = 0; wj < wpts.length; wj++) {
+      var wmx = cx + wpts[wj].y * nedScale;
+      var wmy = cy - wpts[wj].x * nedScale;
+      ctx.fillStyle = "#4da6ff";
+      ctx.beginPath(); ctx.arc(wmx, wmy, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#fff"; ctx.font = "bold 9px Consolas";
+      ctx.fillText(wj + 1, wmx + 7, wmy - 4);
+    }
+  }
+
+  // Flight trail (purple path)
+  purgeTrail();
+  if (nedTrail.length > 1) {
+    ctx.strokeStyle = "rgba(180, 80, 255, 0.7)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    for (var ti = 0; ti < nedTrail.length; ti++) {
+      var tx = cx + nedTrail[ti].y * nedScale;
+      var ty = cy - nedTrail[ti].x * nedScale;
+      if (ti === 0) ctx.moveTo(tx, ty); else ctx.lineTo(tx, ty);
+    }
+    ctx.stroke();
+  }
+
+  // Drone position
+  var dx = cx + droneNED.y * nedScale;
+  var dy = cy - droneNED.x * nedScale;
+  ctx.save(); ctx.translate(dx, dy);
+  ctx.rotate((-droneNED.heading + 90) * Math.PI / 180);
+  ctx.fillStyle = "#e0556a";
+  ctx.beginPath(); ctx.moveTo(0, -10); ctx.lineTo(-6, 6); ctx.lineTo(0, 3); ctx.lineTo(6, 6); ctx.closePath(); ctx.fill();
+  ctx.restore();
+
+  // Scale indicator
+  ctx.fillStyle = "#666"; ctx.font = "10px Consolas";
+  ctx.fillText("1m = " + nedScale + "px", 8, h - 8);
+}
+
+// Canvas click
+document.getElementById("ned-canvas").onclick = function(e) {
+  if (!document.getElementById("mode-indoor").checked) return;
+  var canvas = document.getElementById("ned-canvas");
+  var rect = canvas.getBoundingClientRect();
+  var calcx = canvas.width / 2 + nedOffsetX * nedScale;
+  var calcy = canvas.height / 2 - nedOffsetY * nedScale;
+  var mx = (e.clientX - rect.left);
+  var my = (e.clientY - rect.top);
+  var nx = -(my - calcy) / nedScale;
+  var ny = (mx - calcx) / nedScale;
+  addWaypointRow(nx, ny);
+  redrawNEDCanvas();
+};
+
+// Canvas zoom
+document.getElementById("ned-canvas").onwheel = function(e) {
+  e.preventDefault();
+  var delta = e.deltaY > 0 ? -5 : 5;
+  nedScale = Math.max(10, Math.min(300, nedScale + delta));
+  redrawNEDCanvas();
+};
+
+window.addEventListener("resize", redrawNEDCanvas);
+
+// ============== Waypoint Table ==============
+// Source of truth: lat, lon, alt stored in row dataset
+// Display switches between NED (indoor) and GPS (outdoor)
+var REF_LAT = 32.1148;
+var REF_LON = 118.959;
+
+function nedFromGPS(lat, lon, alt) {
+  var cosLat = Math.cos(REF_LAT * Math.PI / 180);
+  var x = (lat - REF_LAT) * 111320.0;
+  var y = (lon - REF_LON) * 111320.0 * cosLat;
+  var z = -alt;
+  return { x: x, y: y, z: z };
+}
+
+function gpsFromNED(x, y, z) {
+  var cosLat = Math.cos(REF_LAT * Math.PI / 180);
+  var lat = REF_LAT + x / 111320.0;
+  var lon = REF_LON + y / (111320.0 * cosLat);
+  var alt = -z;
+  return { lat: lat, lon: lon, alt: alt };
+}
+
+function getWaypointsFromTable() {
+  var rows = document.querySelectorAll("#wp-tbody tr");
+  var wpts = [];
+  var indoor = document.getElementById("mode-indoor").checked;
+
+  rows.forEach(function(r) {
+    var lat = parseFloat(r.dataset.lat) || 0;
+    var lon = parseFloat(r.dataset.lon) || 0;
+    var alt = parseFloat(r.dataset.alt) || 0;
+    var delay = parseFloat(r.dataset.delay) || 0;
+    var yaw = parseFloat(r.dataset.yaw) || 0;
+
+    var cells = r.querySelectorAll("input");
+    if (cells.length >= 5) {
+      delay = parseFloat(cells[3].value) || delay;
+      yaw = parseFloat(cells[4].value) || yaw;
+      if (indoor) {
+        var nx = parseFloat(cells[0].value) || 0;
+        var ny = parseFloat(cells[1].value) || 0;
+        var nz = parseFloat(cells[2].value) || 0;
+        var gps = gpsFromNED(nx, ny, nz);
+        lat = gps.lat; lon = gps.lon; alt = gps.alt;
+      } else {
+        lat = parseFloat(cells[0].value) || lat;
+        lon = parseFloat(cells[1].value) || lon;
+        alt = parseFloat(cells[2].value) || alt;
+      }
+      r.dataset.lat = lat.toFixed(8);
+      r.dataset.lon = lon.toFixed(8);
+      r.dataset.alt = alt.toFixed(2);
+      r.dataset.delay = delay;
+      r.dataset.yaw = yaw;
+    }
+
+    var ned = nedFromGPS(lat, lon, alt);
+    wpts.push({
+      lat: lat, lon: lon, alt: alt,
+      x: ned.x, y: ned.y, z: ned.z,
+      delay: delay, yaw: yaw
+    });
+  });
+  return wpts;
+}
+
+function addWaypointRowGPS(lat, lon, alt, delay, yaw) {
+  lat = (lat != null ? lat : REF_LAT);
+  lon = (lon != null ? lon : REF_LON);
+  alt = (alt != null ? alt : 3);
+  delay = (delay != null ? delay : 3);
+  yaw = (yaw != null ? yaw : 0);
+
+  var ned = nedFromGPS(lat, lon, alt);
+  var indoor = document.getElementById("mode-indoor").checked;
+  var tbody = document.getElementById("wp-tbody");
+  var idx = tbody.children.length + 1;
+  var tr = document.createElement("tr");
+  tr.dataset.lat = lat.toFixed(8);
+  tr.dataset.lon = lon.toFixed(8);
+  tr.dataset.alt = alt.toFixed(2);
+  tr.dataset.delay = delay;
+  tr.dataset.yaw = yaw;
+
+  if (indoor) {
+    tr.innerHTML = "<td>" + idx + "</td>" +
+      "<td><input type=\"number\" step=\"0.1\" value=\"" + ned.x.toFixed(1) + "\"></td>" +
+      "<td><input type=\"number\" step=\"0.1\" value=\"" + ned.y.toFixed(1) + "\"></td>" +
+      "<td><input type=\"number\" step=\"0.1\" value=\"" + ned.z.toFixed(1) + "\"></td>" +
+      "<td><input type=\"number\" step=\"0.5\" value=\"" + delay.toFixed(1) + "\"></td>" +
+      "<td><input type=\"number\" step=\"1\" value=\"" + yaw.toFixed(0) + "\"></td>" +
+      "<td><button class=\"del-btn\" onclick=\"this.closest('tr').remove();renumberWPs();refreshMapDraw();\">✕</button></td>";
+  } else {
+    tr.innerHTML = "<td>" + idx + "</td>" +
+      "<td><input type=\"number\" step=\"0.000001\" value=\"" + lat.toFixed(6) + "\"></td>" +
+      "<td><input type=\"number\" step=\"0.000001\" value=\"" + lon.toFixed(6) + "\"></td>" +
+      "<td><input type=\"number\" step=\"0.1\" value=\"" + alt.toFixed(1) + "\"></td>" +
+      "<td><input type=\"number\" step=\"0.5\" value=\"" + delay.toFixed(1) + "\"></td>" +
+      "<td><input type=\"number\" step=\"1\" value=\"" + yaw.toFixed(0) + "\"></td>" +
+      "<td><button class=\"del-btn\" onclick=\"this.closest('tr').remove();renumberWPs();refreshMapDraw();\">✕</button></td>";
+  }
+  tbody.appendChild(tr);
+
+  tr.querySelectorAll("input").forEach(function(inp) {
+    inp.onchange = function() { refreshMapDraw(); };
+    inp.oninput = function() { refreshMapDraw(); };
+  });
+}
+
+// Backward-compatible wrapper: NED coordinates -> GPS storage
+function addWaypointRow(nx, ny, nz) {
+  nz = (nz != null ? nz : -3);
+  var gps = gpsFromNED(nx, ny, nz);
+  addWaypointRowGPS(gps.lat, gps.lon, gps.alt, 3, 0);
+}
+
+function renumberWPs() {
+  var rows = document.querySelectorAll("#wp-tbody tr");
+  rows.forEach(function(r, i) { r.children[0].textContent = i + 1; });
+}
+
+function rebuildWpTable() {
+  var rows = document.querySelectorAll("#wp-tbody tr");
+  var data = [];
+  rows.forEach(function(r) {
+    data.push({
+      lat: parseFloat(r.dataset.lat) || REF_LAT,
+      lon: parseFloat(r.dataset.lon) || REF_LON,
+      alt: parseFloat(r.dataset.alt) || 3,
+      delay: parseFloat(r.dataset.delay) || 3,
+      yaw: parseFloat(r.dataset.yaw) || 0
+    });
+    r.remove();
+  });
+  data.forEach(function(d) {
+    addWaypointRowGPS(d.lat, d.lon, d.alt, d.delay, d.yaw);
+  });
+}
+
+function refreshMapDraw() {
+  getWaypointsFromTable();
+  if (document.getElementById("mode-indoor").checked) {
+    redrawNEDCanvas();
+  } else {
+    redrawLeafletWPs();
+  }
+}
+
+document.getElementById("btn-add-wp").onclick = function() {
+  addWaypointRowGPS(REF_LAT, REF_LON, 3, 3, 0);
+  refreshMapDraw();
+};
+document.getElementById("btn-clear-wp").onclick = function() {
+  document.getElementById("wp-tbody").innerHTML = "";
+  refreshMapDraw();
+};
+
+// ============== Leaflet Map ==============
+var leafletInited = false;
+var leafletMap = null;
+var currentTileLayer = null;
+var droneMarker = null;
+var wpMarkers = [];
+var wpPolyline = null;
+
+// Tile sources — OSM blocked in China, use 高德/腾讯 by default
+var TILE_SOURCES = {
+  "gaode": {
+    name: "高德地图",
+    url: "https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}",
+    options: { subdomains: "1234", maxZoom: 18, attribution: "© 高德" }
+  },
+  "gaode_sat": {
+    name: "高德卫星",
+    url: "https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}",
+    options: { subdomains: "1234", maxZoom: 18, attribution: "© 高德卫星" }
+  },
+  "tencent": {
+    name: "腾讯地图",
+    url: "https://rt{s}.map.gtimg.com/tile?z={z}&x={x}&y={y}&type=vector&styleid=1",
+    options: { subdomains: "0123", maxZoom: 18, attribution: "© 腾讯" }
+  },
+  "bing_sat": {
+    name: "必应卫星",
+    url: "",
+    options: { maxZoom: 19, attribution: "© Bing" }
+  },
+  "google_sat": {
+    name: "谷歌卫星",
+    url: "https://mt{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+    options: { subdomains: "0123", maxZoom: 20, attribution: "© Google" }
+  },
+  "google_hyb": {
+    name: "谷歌混合",
+    url: "https://mt{s}.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+    options: { subdomains: "0123", maxZoom: 20, attribution: "© Google" }
+  },
+  "osm": {
+    name: "OSM (国外)",
+    url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    options: { maxZoom: 22, attribution: "© OSM" }
+  }
+};
+
+var currentTileKey = "gaode";
+
+function initLeaflet() {
+  var el = document.getElementById("leaflet-map");
+  leafletMap = L.map(el).setView([32.1148, 118.959], 18);
+  setTileSource(currentTileKey);
+
+  leafletMap.on("click", function(e) {
+    if (!document.getElementById("mode-outdoor").checked) return;
+    addWaypointRowGPS(e.latlng.lat, e.latlng.lng, 10, 3, 0);
+    redrawLeafletWPs();
+  });
+
+  // User manually pans → disable follow
+  leafletMap.on("dragstart", function() {
+    if (followDrone) {
+      followDrone = false;
+      btnFollow.textContent = "跟随 OFF";
+      btnFollow.style.background = "#555";
+    }
+  });
+
+  new ResizeObserver(function() { if (leafletMap) leafletMap.invalidateSize(); })
+    .observe(document.getElementById("map-container"));
+}
+
+function setTileSource(key) {
+  if (!leafletMap) return;
+  if (currentTileLayer) { leafletMap.removeLayer(currentTileLayer); }
+  var src = TILE_SOURCES[key] || TILE_SOURCES["gaode"];
+  currentTileKey = key;
+  if (key === "bing_sat") {
+    currentTileLayer = L.tileLayer("", {
+      maxZoom: 19,
+      attribution: "© Bing",
+      getTileUrl: function(coords) {
+        var qk = tileXYToQuadKey(coords.x, coords.y, coords.z);
+        var s = (coords.x + coords.y) % 4;
+        return "https://t" + s + ".ssl.ak.tiles.virtualearth.net/tiles/a" + qk + ".jpeg?g=1";
+      }
+    }).addTo(leafletMap);
+  } else {
+    currentTileLayer = L.tileLayer(src.url, src.options).addTo(leafletMap);
+  }
+}
+
+function tileXYToQuadKey(x, y, z) {
+  var quadkey = "";
+  for (var i = z; i > 0; i--) {
+    var digit = 0;
+    var mask = 1 << (i - 1);
+    if ((x & mask) !== 0) digit++;
+    if ((y & mask) !== 0) digit += 2;
+    quadkey += digit;
+  }
+  return quadkey;
+}
+
+function redrawLeafletTrail() {
+  if (!leafletMap) return;
+  if (leafletTrailLine) { leafletMap.removeLayer(leafletTrailLine); leafletTrailLine = null; }
+  purgeTrail();
+  if (gpsTrail.length > 1) {
+    var latlngs = gpsTrail.map(function(p) { return [p.lat, p.lon]; });
+    leafletTrailLine = L.polyline(latlngs, { color: "rgba(180,80,255,0.7)", weight: 2, interactive: false }).addTo(leafletMap);
+  }
+}
+
+function updateLeafletMarker() {
+  if (!leafletMap) return;
+  var lat = droneNED.lat || REF_LAT + droneNED.y / 111320.0;
+  var lon = droneNED.lon || REF_LON + droneNED.x / (111320.0 * Math.cos(REF_LAT * Math.PI / 180));
+  var pos = [lat, lon];
+
+  if (!droneMarker) {
+    var icon = L.divIcon({
+      html: "<div style=\"width:14px;height:14px;background:#e0556a;border:2px solid #fff;border-radius:50%;\"></div>",
+      className: "", iconSize: [14, 14], iconAnchor: [7, 7]
+    });
+    droneMarker = L.marker(pos, { icon: icon }).addTo(leafletMap);
+  } else {
+    droneMarker.setLatLng(pos);
+  }
+}
+
+function redrawLeafletWPs() {
+  if (!leafletMap) return;
+  wpMarkers.forEach(function(m) { leafletMap.removeLayer(m); });
+  if (wpPolyline) { leafletMap.removeLayer(wpPolyline); wpPolyline = null; }
+  wpMarkers = [];
+
+  var wpts = getWaypointsFromTable();
+
+  var latlngs = wpts.map(function(wp, i) {
+    var m = L.circleMarker([wp.lat, wp.lon], { radius: 5, color: "#4da6ff", fillColor: "#4da6ff", fillOpacity: 0.8 })
+      .bindTooltip("WP" + (i + 1));
+    m.addTo(leafletMap);
+    wpMarkers.push(m);
+    return [wp.lat, wp.lon];
+  });
+
+  if (latlngs.length > 1) {
+    wpPolyline = L.polyline(latlngs, { color: "#4da6ff", dashArray: "4 4", weight: 2 }).addTo(leafletMap);
+  }
+}
+
+// ============== Mission Control ==============
+var stepByStepActive = false;
+var stepByStepTimer = null;
+var stepByStepIndex = 0;
+
+document.getElementById("btn-upload").onclick = function() {
+  var wpts = getWaypointsFromTable();
+  if (wpts.length === 0) { logStatus("没有航点", "warn"); return; }
+  wsSend("upload_mission", { waypoints: wpts });
+  logStatus("已上传 " + wpts.length + " 个航点", "info");
+};
+
+document.getElementById("btn-mission-start").onclick = function() {
+  stopStepByStep();
+  wsSend("mission_start");
+  logStatus("任务开始", "info");
+};
+
+document.getElementById("btn-mission-pause").onclick = function() {
+  stopStepByStep();
+  wsSend("mission_pause");
+  logStatus("任务暂停", "info");
+};
+
+document.getElementById("btn-step-by-step").onclick = function() {
+  var wpts = getWaypointsFromTable();
+  if (wpts.length === 0) { logStatus("没有航点", "warn"); return; }
+  if (stepByStepActive) { stopStepByStep(); return; }
+  stepByStepActive = true;
+  stepByStepIndex = 0;
+  document.getElementById("btn-step-by-step").textContent = "停止";
+  document.getElementById("btn-step-by-step").classList.add("btn-danger");
+  executeNextWaypoint(wpts);
+};
+
+function executeNextWaypoint(wpts) {
+  if (!stepByStepActive || stepByStepIndex >= wpts.length) {
+    stopStepByStep();
+    logStatus("逐步执行完成", "info");
+    return;
+  }
+  var wp = wpts[stepByStepIndex];
+  wsSend("goto", { north: wp.x, east: wp.y, down: wp.z });
+  logStatus("→ WP" + (stepByStepIndex + 1) + " (" + wp.x + ", " + wp.y + ", " + wp.z + ") 悬停" + wp.delay + "s", "info");
+
+  var waitMs = Math.max(wp.delay || 3, 1) * 1000 + 5000;
+  stepByStepTimer = setTimeout(function() {
+    stepByStepIndex++;
+    var currentWpts = getWaypointsFromTable();
+    executeNextWaypoint(currentWpts);
+  }, waitMs);
+}
+
+function stopStepByStep() {
+  stepByStepActive = false;
+  if (stepByStepTimer) { clearTimeout(stepByStepTimer); stepByStepTimer = null; }
+  var btn = document.getElementById("btn-step-by-step");
+  btn.textContent = "逐步执行";
+  btn.classList.remove("btn-danger");
+}
+
+// ============== Message router ==============
+function handleMessage(msg) {
+  if (msg.type === "connected") {
+    mavConnected = true;
+    updateConnUI(true);
+    logStatus("飞控已连接! sys=" + msg.system, "info");
+  } else if (msg.type === "disconnected") {
+    mavConnected = false;
+    updateConnUI(wsConnected);
+    logStatus("飞控已断开", "warn");
+  } else if (msg.type === "telemetry") {
+    updateTelemetry(msg);
+  } else if (msg.type === "status") {
+    if (msg.level === "error") {
+      mavConnected = false;
+      updateConnUI(wsConnected);
+    }
+    logStatus(msg.msg, msg.level || "info");
+  } else if (msg.type === "mission_progress") {
+    document.getElementById("t-target").textContent = "WP" + (msg.seq + 1) + "/" + msg.total;
+  } else if (msg.type === "pong") {
+    if (msg.mav_connected) {
+      mavConnected = true;
+      updateConnUI(true);
+      logStatus("飞控已在线 (从上次会话恢复)", "info");
+    }
+  } else if (msg.type === "config" && msg.ok) {
+    anchors = msg.anchors;
+    logStatus("已加载 " + anchors.length + " 个UWB锚点", "info");
+    redrawNEDCanvas();
+  }
+}
+
+// ============== Init ==============
+window.addEventListener("beforeunload", function() { wsSend("disconnect"); });
+wsConnect();
+
+// Pre-populate 3 demo waypoints
+addWaypointRow(0, 0, -3, 3, 0);
+addWaypointRow(4, 0, -3, 3, 0);
+addWaypointRow(4, 4, -3, 3, 90);
+
+// Initial canvas render
+setTimeout(function() { redrawNEDCanvas(); }, 150);
+</script>
+</body>
+</html>

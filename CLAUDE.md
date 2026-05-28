@@ -36,7 +36,7 @@ Linear procedural script — no classes, just functions. Key NED coordinate conv
 # GCS Bridge (WebSocket ↔ MAVLink)
 python gcs_bridge.py
 
-# UWB localization — first deploy: calibrate
+# UWB localization — first deploy: calibrate (interactive menu)
 python UWB/uwb.py --calibrate
 
 # UWB localization — daily use (auto-discover serial + load calibration)
@@ -45,6 +45,10 @@ python UWB/uwb.py
 # UWB with manual overrides
 python UWB/uwb.py --port COM3 --baud 19200 --default-height 1.2
 python UWB/uwb.py --mavlink-host 192.168.1.100:14550
+
+# UWB — non-interactive calibration
+python UWB/uwb.py --set-anchors "0,0,1.5;2,0,1.5;0,2,1.5;2,2,1.5"
+python UWB/uwb.py --calibrate --cal-points "0,0,0;1.5,0,0;0,2,0;1.5,2,0"
 
 # Drone mission (edit CONN/BAUD at bottom of file first)
 python drone_mission.py
@@ -61,14 +65,14 @@ pip install pymavlink websockets pyserial numpy
 
 ## Configuration
 
-`UWB/uwb_config.json` is now **optional** — all fields auto-detected. Calibration results cached to `~/.uwb_calib.json`.
+`UWB/uwb_config.json` is now **optional** — all fields auto-detected. Calibration updates `uwb_config.json` directly (with `~/.uwb_calib.json` as backup).
 
 Priority: CLI args > uwb_config.json > ~/.uwb_calib.json > auto-detect
 
 | Key | Purpose | Auto-fallback |
 |-----|---------|---------------|
-| `serial_port` / `baud_rate` | UWB serial connection | Enumeration with `$DIST` probe |
-| `anchors` | `{"S1": [x,y,z], ...}` — anchor positions (meters) | `--calibrate` three-point calibration |
+| `serial_port` / `baud_rate` | UWB serial connection | Enumeration with `$DIST` probe (7 baud rates) |
+| `anchors` | `{"S1": [x,y,z], ...}` — anchor positions (meters) | `--calibrate` interactive (3 modes: step/known-points/direct) |
 | `output.terminal` | Print to stdout | Always on |
 | `output.udp_broadcast` | UDP JSON to GCS (host/port) | Off by default |
 | `output.mavlink` | MAVLink GPS_INPUT to FC (host/port) | Off by default |

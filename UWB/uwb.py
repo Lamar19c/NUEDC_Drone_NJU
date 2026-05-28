@@ -14,6 +14,8 @@ UWB 室内 3D 定位模块 — 零配置版
     from uwb import AnchorConfig, UWBSolver, SerialReader, OutputRouter, local_to_gps
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import math
@@ -65,9 +67,10 @@ class AnchorConfig:
             print(f"  发现 UWB 设备: {result[0]} @ {result[1]} baud")
             return result
         else:
-            print("  未找到 UWB 设备，使用默认 COM3 @ 19200")
-            return (data.get("serial_port", "COM3"),
-                    data.get("baud_rate", 19200))
+            default_port = "COM3" if sys.platform == "win32" else "/dev/ttyUSB0"
+        print(f"  未找到 UWB 设备，使用默认 {default_port} @ 19200")
+        return (data.get("serial_port", default_port),
+                data.get("baud_rate", 19200))
 
     @classmethod
     def _resolve_anchors(cls, data: dict) -> dict:
@@ -135,7 +138,7 @@ class AnchorConfig:
 # ---- calibration cache ----
 
 CALIB_CACHE = os.path.join(os.path.expanduser("~"), ".uwb_calib.json")
-BAUD_RATES = [19200, 115200, 57600]
+BAUD_RATES = [921600, 115200, 57600, 19200, 38400, 9600, 230400]
 
 
 def load_calibration_cache() -> Optional[dict]:
@@ -145,41 +148,123 @@ def load_calibration_cache() -> Optional[dict]:
     return None
 
 
+def save_anchors_to_config(config_path: str, anchors: dict) -> None:
+    """将锚点坐标写入 uwb_config.json 的 anchors 字段"""
+    data = {}
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    data["anchors"] = anchors
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    print(f"  锚点坐标已保存到 {config_path}")
+
+
 def save_calibration_cache(anchors: dict) -> None:
+    """后备：同时存一份到用户目录缓存"""
     with open(CALIB_CACHE, "w", encoding="utf-8") as f:
         json.dump({"anchors": anchors}, f, indent=2)
     print(f"  锚点坐标已缓存到 {CALIB_CACHE}")
 
 
-def auto_discover_uwb() -> Optional[tuple]:
+def auto_discover_uwb(verbose: bool = True) -> Optional[tuple]:
     """枚举串口寻找 UWB 设备，返回 (port, baud_rate) 或 None"""
     ports = [p.device for p in serial.tools.list_ports.comports()]
     if not ports:
+        if verbose:
+            print("    未检测到任何串口设备")
         return None
+
+    if verbose:
+        print(f"    发现 {len(ports)} 个串口: {', '.join(ports)}")
 
     for port in ports:
         for baud in BAUD_RATES:
+            if verbose:
+                print(f"    尝试 {port} @ {baud} ...", end=" ", flush=True)
             try:
                 ser = serial.Serial(port, baud, timeout=0.5)
                 ser.write(b"\r\n")
                 time.sleep(0.3)
                 buf = b""
                 t0 = time.time()
-                while time.time() - t0 < 1.0:
+                while time.time() - t0 < 1.5:
                     chunk = ser.read(256)
                     if chunk:
                         buf += chunk
                     if b"$DIST" in buf:
                         ser.close()
+                        if verbose:
+                            print("✓ 找到 UWB 设备")
                         return (port, baud)
                 ser.close()
-            except Exception:
-                pass
+                if verbose:
+                    print("✗ 无 $DIST 响应")
+            except Exception as e:
+                if verbose:
+                    print(f"✗ {e}")
+    if verbose:
+        print("    未找到 UWB 设备")
     return None
 
 
+def _read_distances_avg(reader: SerialReader, n_samples: int = 5,
+                        timeout: float = 2.0) -> Optional[list]:
+    """读取多组距离取均值"""
+    all_dists = []
+    for _ in range(n_samples):
+        d = reader.read_distances(timeout=timeout)
+        if d:
+            all_dists.append(d)
+        time.sleep(0.1)
+    if not all_dists:
+        return None
+    arr = np.array(all_dists)
+    return arr.mean(axis=0).tolist()
+
+
+def _print_anchors(anchors: dict) -> None:
+    """打印锚点坐标"""
+    for k, v in anchors.items():
+        print(f"    {k}: ({v[0]:.2f}, {v[1]:.2f}, {v[2]:.2f})")
+
+
+def _solve_anchors_from_measurements(measurements: list,
+                                      positions: list) -> dict:
+    """从已知标签位置和距离测量反算锚点坐标。
+
+    measurements: [[d1, d2, ...], ...]  每个位置的测距列表
+    positions:    [(x, y, z), ...]      对应的已知标签坐标
+    返回: {"S1": [x,y,z], "S2": [x,y,z], ...}
+    """
+    n_anchors = len(measurements[0])
+    n_points = len(positions)
+    p0 = np.array(positions[0])
+    p0_norm_sq = np.dot(p0, p0)
+    d0_arr = np.array(measurements[0])
+
+    anchors = {}
+    for ai in range(n_anchors):
+        d0 = d0_arr[ai]
+        A = np.zeros((n_points - 1, 3))
+        b = np.zeros(n_points - 1)
+        for j in range(1, n_points):
+            pj = np.array(positions[j])
+            dj = measurements[j][ai]
+            A[j - 1] = 2.0 * (pj - p0)
+            b[j - 1] = d0**2 - dj**2 - p0_norm_sq + np.dot(pj, pj)
+        result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        anchors[f"S{ai + 1}"] = [round(float(result[0]), 4),
+                                  round(float(result[1]), 4),
+                                  round(float(result[2]), 4)]
+    return anchors
+
+
 def calibrate_anchors(port: str, baud: int, step: float = 1.0) -> Optional[dict]:
-    """三点标定法：引导用户将 M1 放在三个位置，反算锚点坐标"""
+    """三点标定法：引导用户将 M1 放在三个位置，反算锚点坐标
+
+    step 仅作为默认值，交互式下会提示用户输入实际测量距离。
+    """
     reader = SerialReader(port, baud)
     try:
         reader.open()
@@ -187,27 +272,25 @@ def calibrate_anchors(port: str, baud: int, step: float = 1.0) -> Optional[dict]
         print(f"  错误: 无法打开串口 {port}: {e}")
         return None
 
-    def read_distances_avg(n_samples: int = 5) -> Optional[list]:
-        """读取多组距离取均值"""
-        all_dists = []
-        for _ in range(n_samples):
-            d = reader.read_distances(timeout=2.0)
-            if d:
-                all_dists.append(d)
-            time.sleep(0.1)
-        if not all_dists:
-            return None
-        arr = np.array(all_dists)
-        return arr.mean(axis=0).tolist()
+    # 提示输入步长
+    step_str = input(f"\n  请输入标签移动步长(米) [默认={step}]: ").strip()
+    if step_str:
+        try:
+            step = float(step_str)
+        except ValueError:
+            print(f"  输入无效，使用默认步长 {step}m")
+    print(f"  使用步长: {step}m")
 
-    positions = [(0, 0, "原点"), (step, 0, f"X+{step}m"), (0, step, f"Y+{step}m")]
+    positions = [(0, 0, 0, "原点"),
+                 (step, 0, 0, f"X+{step}m"),
+                 (0, step, 0, f"Y+{step}m")]
     measurements = []
 
-    for i, (px, py, label) in enumerate(positions):
-        print(f"\n  [{i+1}/3] 将 M1 放在 ({px}, {py}, 0) = {label}，按 Enter 确认...", end="", flush=True)
+    for i, (px, py, pz, label) in enumerate(positions):
+        print(f"\n  [{i+1}/3] 将 M1 放在 ({px}, {py}, {pz}) = {label}，按 Enter 确认...", end="", flush=True)
         input()
         print("    读取中...", end=" ", flush=True)
-        d = read_distances_avg()
+        d = _read_distances_avg(reader)
         if d is None:
             print("✗ 未收到数据，标定失败")
             reader.close()
@@ -217,24 +300,157 @@ def calibrate_anchors(port: str, baud: int, step: float = 1.0) -> Optional[dict]
 
     reader.close()
 
-    n_anchors = len(measurements[0])
-    d0 = np.array(measurements[0])
-    dx = np.array(measurements[1])
-    dy = np.array(measurements[2])
-
-    anchors = {}
-    for i in range(n_anchors):
-        x = (d0[i]**2 - dx[i]**2 + step**2) / (2 * step)
-        y = (d0[i]**2 - dy[i]**2 + step**2) / (2 * step)
-        z_sq = d0[i]**2 - x**2 - y**2
-        z = math.sqrt(max(z_sq, 0.0))
-        anchors[f"S{i+1}"] = [round(x, 4), round(y, 4), round(z, 4)]
+    # 仅保留坐标部分传给求解器
+    pos_xyz = [(px, py, pz) for px, py, pz, _ in positions]
+    anchors = _solve_anchors_from_measurements(measurements, pos_xyz)
 
     print(f"\n  ✓ 标定完成，锚点坐标：")
-    for k, v in anchors.items():
-        print(f"    {k}: ({v[0]:.2f}, {v[1]:.2f}, {v[2]:.2f})")
-
+    _print_anchors(anchors)
     return anchors
+
+
+def calibrate_anchors_with_points(port: str, baud: int,
+                                    points: Optional[list] = None) -> Optional[dict]:
+    """已知点位标定法：将标签放在已知坐标点，反算锚点坐标。
+
+    points: [(x, y, z, label), ...] — 如果为 None 则交互式输入
+    至少需要 3 个不共线点位。
+    """
+    reader = SerialReader(port, baud)
+    try:
+        reader.open()
+    except Exception as e:
+        print(f"  错误: 无法打开串口 {port}: {e}")
+        return None
+
+    if points is None:
+        # 交互式输入点位
+        points = []
+        print("\n  已知点位标定 — 将标签依次放在已知坐标点")
+        print("  输入格式: x,y,z （如: 0,0,0  或 1.5,0,0.2）")
+        print("  至少需要 3 个点，空行结束输入\n")
+        while True:
+            label = input(f"  点位{len(points) + 1} 坐标 (x,y,z): ").strip()
+            if not label:
+                if len(points) >= 3:
+                    break
+                print(f"    至少需要 3 个点，当前仅 {len(points)} 个")
+                continue
+            try:
+                parts = [float(v.strip()) for v in label.split(",")]
+                if len(parts) != 3:
+                    print("    格式错误，请输入 x,y,z")
+                    continue
+            except ValueError:
+                print("    格式错误，请输入数字")
+                continue
+            points.append((parts[0], parts[1], parts[2],
+                           f"({parts[0]},{parts[1]},{parts[2]})"))
+    else:
+        # 确保每个元素是 4 元组
+        points = [(p[0], p[1], p[2], p[3] if len(p) > 3 else f"({p[0]},{p[1]},{p[2]})")
+                  for p in points]
+
+    if len(points) < 3:
+        print(f"  错误: 至少需要 3 个点位，当前仅 {len(points)} 个")
+        reader.close()
+        return None
+
+    measurements = []
+    for i, (px, py, pz, label) in enumerate(points):
+        print(f"\n  [{i + 1}/{len(points)}] 将 M1 放在 {label}，按 Enter 确认...", end="", flush=True)
+        input()
+        print("    读取中...", end=" ", flush=True)
+        d = _read_distances_avg(reader)
+        if d is None:
+            print("✗ 未收到数据，标定失败")
+            reader.close()
+            return None
+        measurements.append(d)
+        print(f"{'  '.join(f'S{j + 1}={v:.2f}m' for j, v in enumerate(d))} ✓")
+
+    reader.close()
+
+    pos_xyz = [(px, py, pz) for px, py, pz, _ in points]
+    anchors = _solve_anchors_from_measurements(measurements, pos_xyz)
+
+    print(f"\n  ✓ 标定完成，锚点坐标：")
+    _print_anchors(anchors)
+    return anchors
+
+
+def set_anchors_directly(num_anchors: Optional[int] = None) -> dict:
+    """直接输入锚点坐标（跳过测量）。
+
+    num_anchors: 锚点数量，如果为 None 则交互式询问
+    """
+    if num_anchors is None:
+        n_str = input("  锚点数量 [默认=4]: ").strip()
+        try:
+            num_anchors = int(n_str) if n_str else 4
+        except ValueError:
+            num_anchors = 4
+
+    print(f"\n  直接输入 {num_anchors} 个锚点坐标")
+    print("  输入格式: x,y,z （如: 0,0,1.5）\n")
+
+    anchors = {}
+    for i in range(num_anchors):
+        while True:
+            val = input(f"  S{i + 1} 坐标 (x,y,z): ").strip()
+            try:
+                parts = [float(v.strip()) for v in val.split(",")]
+                if len(parts) != 3:
+                    print("    格式错误，请输入 x,y,z")
+                    continue
+                anchors[f"S{i + 1}"] = parts
+                break
+            except ValueError:
+                print("    格式错误，请输入数字")
+
+    print(f"\n  ✓ 锚点坐标已设置：")
+    _print_anchors(anchors)
+    return anchors
+
+
+def calibrate_anchors_interactive(port: str, baud: int) -> Optional[dict]:
+    """交互式标定入口 — 用户选择标定方式"""
+    print("\n" + "=" * 50)
+    print("  UWB 锚点标定")
+    print("=" * 50)
+    print("\n  选择标定方式:")
+    print("    1. 步长标定 — 移动标签并测量实际距离")
+    print("    2. 已知点位标定 — 将标签放在场地已知坐标点")
+    print("    3. 直接输入锚点坐标（跳过测量）")
+
+    while True:
+        choice = input("\n  请输入 [1/2/3]: ").strip()
+        if choice == "1":
+            return calibrate_anchors(port, baud)
+        elif choice == "2":
+            return calibrate_anchors_with_points(port, baud)
+        elif choice == "3":
+            return set_anchors_directly()
+        else:
+            print("  无效选择，请输入 1、2 或 3")
+
+
+def _parse_points_arg(arg: str) -> list:
+    """解析 --cal-points / --set-anchors 参数。
+
+    格式: "x1,y1,z1;x2,y2,z2;..."
+    返回: [(x1,y1,z1), (x2,y2,z2), ...]
+    """
+    points = []
+    for item in arg.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        parts = [float(v.strip()) for v in item.split(",")]
+        if len(parts) != 3:
+            raise ValueError(f"点位格式错误: '{item}'，需要 x,y,z")
+        points.append(tuple(parts))
+    return points
 
 
 # ============================================================================
@@ -650,6 +866,10 @@ def main():
                         help="三点标定法标定锚点坐标")
     parser.add_argument("--step", type=float, default=1.0,
                         help="标定时 M1 移动步长 (默认: 1.0m)")
+    parser.add_argument("--cal-points", default=None,
+                        help="已知点位标定 (格式: \"x1,y1,z1;x2,y2,z2;...\"，至少3个点)")
+    parser.add_argument("--set-anchors", default=None,
+                        help="直接设置锚点坐标 (格式: \"x1,y1,z1;x2,y2,z2;...\")")
     parser.add_argument("--no-udp", action="store_true",
                         help="强制关闭 UDP 输出")
     parser.add_argument("--no-mavlink", action="store_true",
@@ -658,8 +878,25 @@ def main():
                         help="飞控 MAVLink 地址 (格式: host:port)")
     args = parser.parse_args()
 
-    # ---- calibrate mode: guide user, save cache, exit ----
-    if args.calibrate:
+    # ---- calibrate / set-anchors mode: configure anchors, save cache, exit ----
+    if args.calibrate or args.set_anchors:
+        # --set-anchors: 直接设置锚点，无需串口
+        if args.set_anchors:
+            try:
+                pts = _parse_points_arg(args.set_anchors)
+            except ValueError as e:
+                print(f"  参数错误: {e}")
+                sys.exit(1)
+            anchors = {}
+            for i, (x, y, z) in enumerate(pts):
+                anchors[f"S{i + 1}"] = [x, y, z]
+            print(f"\n  ✓ 锚点坐标已设置：")
+            _print_anchors(anchors)
+            save_anchors_to_config(args.config, anchors)
+            save_calibration_cache(anchors)
+            return
+
+        # --calibrate: 需要串口
         port = args.port
         baud = args.baud or 19200
         if not port:
@@ -672,8 +909,20 @@ def main():
                 print("  未找到 UWB 设备，请用 --port 指定")
                 sys.exit(1)
 
-        anchors = calibrate_anchors(port, baud, args.step)
+        # --cal-points: 非交互式已知点位标定
+        if args.cal_points:
+            try:
+                pts = _parse_points_arg(args.cal_points)
+            except ValueError as e:
+                print(f"  参数错误: {e}")
+                sys.exit(1)
+            anchors = calibrate_anchors_with_points(port, baud, pts)
+        else:
+            # 交互式标定
+            anchors = calibrate_anchors_interactive(port, baud)
+
         if anchors:
+            save_anchors_to_config(args.config, anchors)
             save_calibration_cache(anchors)
         else:
             sys.exit(1)

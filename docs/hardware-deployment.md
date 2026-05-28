@@ -105,14 +105,29 @@ Pi USB   ────→ 7寸屏 USB (触摸 + 供电，可选)
 # 烧录后创建 SSH 文件 + wpa_supplicant.conf 联网
 ```
 
-### 2. 安装依赖
+### 2. 串口权限配置
+
+Linux 下普通用户默认无串口读写权限，必须先配置：
+
+```bash
+# 将当前用户加入 dialout 组（推荐，重启后生效）
+sudo usermod -aG dialout $USER
+
+# 或创建 udev 规则固定设备名 + 权限（插拔自动生效）
+# 先查 UWB 设备的 USB VID/PID：lsusb
+# 然后创建 /etc/udev/rules.d/99-uwb.rules：
+# SUBSYSTEM=="tty", ATTRS{idVendor}=="xxxx", ATTRS{idProduct}=="xxxx", MODE="0666", SYMLINK+="uwb_device"
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+### 3. 安装依赖
 
 ```bash
 sudo apt update && sudo apt install -y python3-pip python3-opencv
 pip3 install pymavlink websockets pyserial numpy
 ```
 
-### 3. 部署代码
+### 4. 部署代码
 
 ```bash
 # 两个 Pi 都克隆同一份代码
@@ -120,7 +135,7 @@ git clone <repo> ~/gcs
 cd ~/gcs/main
 ```
 
-### 4. 机载 Pi 开机启动
+### 5. 机载 Pi 开机启动
 
 ```bash
 # /etc/systemd/system/onboard.service
@@ -143,7 +158,7 @@ WantedBy=multi-user.target
 sudo systemctl enable onboard.service
 ```
 
-### 5. 地面 Pi 开机启动
+### 6. 地面 Pi 开机启动
 
 ```bash
 # /etc/systemd/system/gcs.service
@@ -197,7 +212,11 @@ L = 房间长度, W = 房间宽度 (米)
 
 - 锚点安装在房间四角，高度 2-3 米
 - 测量相对 NED 坐标系的实际位置
-- 写入 `UWB/uwb_config.json`：
+- 方式一：命令行直接设置
+  ```bash
+  python UWB/uwb.py --set-anchors "0,0,2.5;5,0,2.5;0,4,2.5;5,4,2.5"
+  ```
+- 方式二：手动写入 `UWB/uwb_config.json`：
 
 ```json
 {

@@ -16,6 +16,12 @@ main/
 └── CLAUDE.md               # Claude Code 项目指引
 ```
 
+## 环境要求
+
+- Python ≥ 3.8
+- 操作系统：Windows 10+ / Ubuntu 20.04+ / Raspberry Pi OS (Bookworm)
+- Linux 需配置串口权限（见下方）
+
 ## 快速开始
 
 ### 1. 安装依赖
@@ -37,8 +43,11 @@ python gcs_bridge.py
 ### 4. 室内定位（可选）
 
 ```bash
-# 首次部署：标定锚点
+# 首次部署：标定锚点（交互式菜单，三种方式可选）
 python UWB/uwb.py --calibrate
+
+# 直接设置锚点坐标（已知场地尺寸）
+python UWB/uwb.py --set-anchors "0,0,1.5;2,0,1.5;0,2,1.5;2,2,1.5"
 
 # 日常使用：自动发现串口 + 加载标定结果
 python UWB/uwb.py
@@ -47,7 +56,7 @@ python UWB/uwb.py
 python UWB/uwb.py --mavlink-host 192.168.1.100:14550
 ```
 
-标定结果缓存在 `~/.uwb_calib.json`，下次启动自动加载。
+标定结果直接写入 `UWB/uwb_config.json`，同时缓存到 `~/.uwb_calib.json` 作为后备。
 
 ## 连接方式
 

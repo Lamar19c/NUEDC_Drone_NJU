@@ -11,7 +11,7 @@
   "output": {
     "terminal": true,
     "udp_broadcast": {"enabled": true, "host": "127.0.0.1", "port": 14550},
-    "mavlink": {"enabled": false, "host": "192.168.1.100", "port": 14550}
+    "gps_emulation": {"enabled": false, "serial_port": "/dev/ttyS6", "serial_baud": 57600}
   },
   "ekf_origin_lat": 321148408,
   "ekf_origin_lon": 1189590664,

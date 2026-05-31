@@ -8,7 +8,8 @@ UWB 室内 3D 定位模块 — 零配置版
 
 日常:
     python uwb.py [--port COMx] [--baud 19200] [--default-height 1.0]
-    python uwb.py --no-udp --mavlink-host 192.168.1.100:14550
+    python uwb.py --no-udp --gps-emu-serial /dev/ttyS6 --gps-emu-baud 57600
+    python uwb.py --gps-emu-serial COM4          # 指定飞控GPS端口
 
 嵌入调用:
     from uwb import AnchorConfig, UWBSolver, SerialReader, OutputRouter, local_to_gps
@@ -45,9 +46,9 @@ class AnchorConfig:
     udp_enabled: bool
     udp_host: str
     udp_port: int
-    mavlink_enabled: bool
-    mavlink_host: str
-    mavlink_port: int
+    gps_emu_enabled: bool
+    gps_emu_serial_port: str
+    gps_emu_serial_baud: int
     ekf_origin_lat: int
     ekf_origin_lon: int
     ekf_origin_alt: int
@@ -107,7 +108,7 @@ class AnchorConfig:
 
         output = data.get("output", {})
         udp = output.get("udp_broadcast", {})
-        mav = output.get("mavlink", {})
+        gps_emu = output.get("gps_emulation", {})
 
         lat, lon, alt = cls._resolve_ekf_origin(data)
 
@@ -119,9 +120,9 @@ class AnchorConfig:
             udp_enabled=udp.get("enabled", False),
             udp_host=udp.get("host", "127.0.0.1"),
             udp_port=udp.get("port", 14550),
-            mavlink_enabled=mav.get("enabled", False),
-            mavlink_host=mav.get("host", "192.168.1.100"),
-            mavlink_port=mav.get("port", 14550),
+            gps_emu_enabled=gps_emu.get("enabled", False),
+            gps_emu_serial_port=gps_emu.get("serial_port", "/dev/ttyS6"),
+            gps_emu_serial_baud=gps_emu.get("serial_baud", 57600),
             ekf_origin_lat=lat,
             ekf_origin_lon=lon,
             ekf_origin_alt=alt,
@@ -206,6 +207,8 @@ def auto_discover_uwb(verbose: bool = True) -> Optional[tuple]:
     if verbose:
         print("    未找到 UWB 设备")
     return None
+
+
 
 
 def _read_distances_avg(reader: SerialReader, n_samples: int = 5,
@@ -696,73 +699,88 @@ def local_to_gps(x: float, y: float, z: float,
     return (lat, lon, alt)
 
 
+def _deg_to_nmea(lat_e7: int, lon_e7: int) -> tuple:
+    """E7 格式经纬度 → NMEA ddmm.mmmm 格式
+
+    返回 (lat_str, lat_dir, lon_str, lon_dir)
+    例: (321148408, 1189590664) → ("3206.8904", "N", "11857.5440", "E")
+    """
+    lat_deg = lat_e7 / 1e7
+    lon_deg = lon_e7 / 1e7
+
+    lat_abs = abs(lat_deg)
+    lat_d = int(lat_abs)
+    lat_m = (lat_abs - lat_d) * 60.0
+    lat_str = f"{lat_d:02d}{lat_m:07.4f}"
+    lat_dir = "N" if lat_deg >= 0 else "S"
+
+    lon_abs = abs(lon_deg)
+    lon_d = int(lon_abs)
+    lon_m = (lon_abs - lon_d) * 60.0
+    lon_str = f"{lon_d:03d}{lon_m:07.4f}"
+    lon_dir = "E" if lon_deg >= 0 else "W"
+
+    return (lat_str, lat_dir, lon_str, lon_dir)
+
+
+def _nmea_checksum(sentence: str) -> str:
+    """NMEA 异或校验和 (XOR of all chars between $ and *)"""
+    cksum = 0
+    for c in sentence[1:]:
+        cksum ^= ord(c)
+    return f"{cksum:02X}"
+
+
 class OutputRouter:
-    """三路输出: 终端 / UDP广播(给GCS) / WiFi MAVLink(给飞控)"""
+    """三路输出: 终端 / UDP广播(给GCS) / 串口 NMEA GPS 模拟(给飞控GPS端口)
+
+    GPS 模拟通过标准 NMEA 语句 ($GPGGA + $GPRMC) 发送到飞控 GPS 串口，
+    飞控以 GPS 协议 (SERIALx_PROTOCOL=5) 接收，与真实 GPS 模块完全一致。
+    """
+
+    # NMEA 输出频率 (Hz)
+    NMEA_RATE_HZ = 5
 
     def __init__(self, config: AnchorConfig):
         self.config = config
         self.udp_socket: Optional[socket.socket] = None
-        self.mavlink_conn = None
+        self._gps_serial: Optional[serial.Serial] = None
+        self._last_nmea_time: float = 0.0
 
         if config.udp_enabled:
             self._init_udp()
 
-        if config.mavlink_enabled:
-            self._init_mavlink()
+        if config.gps_emu_enabled:
+            self._init_gps_emulation()
+
+    # ---- UDP ----
 
     def _init_udp(self) -> None:
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_target = (self.config.udp_host, self.config.udp_port)
         print(f"UDP 输出: {self.config.udp_host}:{self.config.udp_port}")
 
-    def _init_mavlink(self) -> None:
-        try:
-            from pymavlink import mavutil
-            self.mavlink_conn = mavutil.mavlink_connection(
-                f"udp:{self.config.mavlink_host}:{self.config.mavlink_port}",
-                source_system=1,
-                source_component=1,
-                input=False,
-            )
-            print(f"MAVLink 输出: {self.config.mavlink_host}:{self.config.mavlink_port}")
-        except Exception as e:
-            print(f"MAVLink 初始化失败: {e}")
-            self.mavlink_conn = None
+    # ---- NMEA GPS 模拟 ----
 
-    def try_read_ekf_origin(self, timeout: float = 5.0) -> bool:
-        """尝试从飞控读取 HOME_POSITION 作为 EKF 原点，成功返回 True"""
-        if not self.config.mavlink_enabled or self.mavlink_conn is None:
-            return False
-
+    def _init_gps_emulation(self) -> None:
+        """打开串口连接到飞控 GPS 端口（无需 pymavlink）"""
         try:
-            from pymavlink import mavutil
-            conn = mavutil.mavlink_connection(
-                f"udp:{self.config.mavlink_host}:{self.config.mavlink_port}",
-                source_system=1,
-                source_component=1,
-                input=True,
+            self._gps_serial = serial.Serial(
+                port=self.config.gps_emu_serial_port,
+                baudrate=self.config.gps_emu_serial_baud,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0,
+                write_timeout=0.5,
             )
-            print(f"  等待飞控 HOME_POSITION ({timeout}s)...", end=" ", flush=True)
-            t0 = time.time()
-            while time.time() - t0 < timeout:
-                msg = conn.recv_match(type="HOME_POSITION", blocking=False)
-                if msg:
-                    lat = getattr(msg, "latitude", None)
-                    lon = getattr(msg, "longitude", None)
-                    alt = getattr(msg, "altitude", None)
-                    if lat and lon:
-                        self.config.ekf_origin_lat = int(lat)
-                        self.config.ekf_origin_lon = int(lon)
-                        self.config.ekf_origin_alt = int(alt * 1000) if alt else self.config.ekf_origin_alt
-                        print(f"✓ lat={lat}, lon={lon}, alt={alt}")
-                        conn.close()
-                        return True
-                time.sleep(0.1)
-            print("超时，使用默认值")
-            conn.close()
+            print(f"NMEA GPS 模拟输出: {self.config.gps_emu_serial_port} "
+                  f"@ {self.config.gps_emu_serial_baud} baud")
         except Exception as e:
-            print(f"失败: {e}")
-        return False
+            print(f"NMEA GPS 串口初始化失败: {e}")
+            self._gps_serial = None
+
+    # ---- 位置输出 ----
 
     def output_position(self, x: float, y: float, z: float,
                         vx: float, vy: float, vz: float,
@@ -791,57 +809,74 @@ class OutputRouter:
             except OSError:
                 pass
 
-        if self.config.mavlink_enabled:
-            self._send_mavlink_gps_input(x, y, z, vx, vy, vz, timestamp)
+        if self.config.gps_emu_enabled:
+            self._send_nmea_sentences(x, y, z, vx, vy, vz, timestamp)
 
-    def _send_mavlink_gps_input(self, x: float, y: float, z: float,
-                                 vx: float, vy: float, vz: float,
-                                 timestamp: float) -> None:
-        if not self.mavlink_conn:
+    def _send_nmea_sentences(self, x: float, y: float, z: float,
+                              vx: float, vy: float, vz: float,
+                              timestamp: float) -> None:
+        """生成并发送 $GPGGA + $GPRMC NMEA 语句到飞控 GPS 端口"""
+        if not self._gps_serial or not self._gps_serial.is_open:
             return
 
-        lat, lon, alt = local_to_gps(
+        # 限速：不超过 NMEA_RATE_HZ
+        min_interval = 1.0 / self.NMEA_RATE_HZ
+        if timestamp - self._last_nmea_time < min_interval:
+            return
+        self._last_nmea_time = timestamp
+
+        # 1. UWB 局部坐标 → GPS (E7)
+        lat_e7, lon_e7, alt_mm = local_to_gps(
             x, y, z,
             self.config.ekf_origin_lat,
             self.config.ekf_origin_lon,
             self.config.ekf_origin_alt,
         )
+        alt_m = alt_mm / 1000.0
 
-        alt_m = alt / 1000.0
-        vn = vy
-        ve = vx
-        vd = vz
+        # 2. E7 → NMEA ddmm.mmmm
+        lat_str, lat_dir, lon_str, lon_dir = _deg_to_nmea(lat_e7, lon_e7)
 
-        self.mavlink_conn.mav.gps_input_send(
-            0,              # time_usec
-            0,              # gps_id
-            0,              # ignore_flags
-            0,              # time_week_ms
-            0,              # time_week
-            3,              # fix_type = 3 (3D fix)
-            lat,            # lat (E7)
-            lon,            # lon (E7)
-            alt_m,          # alt (meters)
-            1.0,            # hdop
-            1.0,            # vdop
-            vn,             # vn (m/s)
-            ve,             # ve (m/s)
-            vd,             # vd (m/s)
-            1.0,            # speed_accuracy
-            1.0,            # horiz_accuracy
-            1.0,            # vert_accuracy
-            0,              # satellites_visible
-        )
+        # 3. 时间戳
+        dt = time.localtime(timestamp)
+        time_str = time.strftime("%H%M%S", dt)
+        date_str = time.strftime("%d%m%y", dt)
+
+        # 4. 速度 (m/s → knots, 水平合成)
+        speed_ms = math.sqrt(vx * vx + vy * vy)
+        speed_kn = speed_ms * 1.94384
+        course = math.degrees(math.atan2(vx, vy))  # 东/北 → 真北角
+        if course < 0:
+            course += 360
+
+        # 5. 组装并发送
+        try:
+            # $GPGGA — 定位数据
+            ggpa = f"$GPGGA,{time_str}.00,{lat_str},{lat_dir},{lon_str},{lon_dir}," \
+                   f"1,08,1.0,{alt_m:.1f},M,0.0,M,,"
+            ggpa += f"*{_nmea_checksum(ggpa)}\r\n"
+            self._gps_serial.write(ggpa.encode("ascii"))
+
+            # $GPRMC — 最小推荐数据（含速度/航向）
+            rmc = f"$GPRMC,{time_str}.00,A,{lat_str},{lat_dir},{lon_str},{lon_dir}," \
+                  f"{speed_kn:.2f},{course:.1f},{date_str},,,A"
+            rmc += f"*{_nmea_checksum(rmc)}\r\n"
+            self._gps_serial.write(rmc.encode("ascii"))
+        except (OSError, serial.SerialException):
+            pass  # 串口写入失败（断连等），静默跳过
+
+    # ---- 清理 ----
 
     def close(self) -> None:
         if self.udp_socket:
             self.udp_socket.close()
             self.udp_socket = None
-        if self.mavlink_conn:
+        if self._gps_serial:
             try:
-                self.mavlink_conn.close()
+                self._gps_serial.close()
             except Exception:
                 pass
+            self._gps_serial = None
 
 
 # ============================================================================
@@ -872,10 +907,12 @@ def main():
                         help="直接设置锚点坐标 (格式: \"x1,y1,z1;x2,y2,z2;...\")")
     parser.add_argument("--no-udp", action="store_true",
                         help="强制关闭 UDP 输出")
-    parser.add_argument("--no-mavlink", action="store_true",
-                        help="强制关闭 MAVLink 输出")
-    parser.add_argument("--mavlink-host", default=None,
-                        help="飞控 MAVLink 地址 (格式: host:port)")
+    parser.add_argument("--no-gps-emu", action="store_true",
+                        help="强制关闭 NMEA GPS 模拟输出")
+    parser.add_argument("--gps-emu-serial", default=None,
+                        help="飞控 GPS 串口设备 (如 /dev/ttyS6, COM4)")
+    parser.add_argument("--gps-emu-baud", type=int, default=None,
+                        help="飞控 GPS 串口波特率 (默认: 57600)")
     args = parser.parse_args()
 
     # ---- calibrate / set-anchors mode: configure anchors, save cache, exit ----
@@ -938,14 +975,13 @@ def main():
         cfg.baud_rate = args.baud
     if args.no_udp:
         cfg.udp_enabled = False
-    if args.no_mavlink:
-        cfg.mavlink_enabled = False
-    if args.mavlink_host:
-        parts = args.mavlink_host.rsplit(":", 1)
-        cfg.mavlink_enabled = True
-        cfg.mavlink_host = parts[0]
-        if len(parts) == 2:
-            cfg.mavlink_port = int(parts[1])
+    if args.no_gps_emu:
+        cfg.gps_emu_enabled = False
+    if args.gps_emu_serial:
+        cfg.gps_emu_enabled = True
+        cfg.gps_emu_serial_port = args.gps_emu_serial
+    if args.gps_emu_baud:
+        cfg.gps_emu_serial_baud = args.gps_emu_baud
 
     positions = cfg.anchor_positions()
     n_anchors = positions.shape[0]
@@ -963,13 +999,13 @@ def main():
     solver = UWBSolver(positions, default_height=args.default_height)
     router = OutputRouter(cfg)
 
-    if cfg.mavlink_enabled:
-        router.try_read_ekf_origin()
+    # NMEA 是单向输出（机载计算机 → 飞控 GPS 口），无法读取 HOME_POSITION。
+    # EKF 原点需在 uwb_config.json 的 ekf_origin_lat/lon/alt 中手动配置。
 
     print(f"\n串口: {cfg.serial_port} @ {cfg.baud_rate} baud")
     print(f"输出: terminal={'ON' if cfg.output_terminal else 'OFF'}"
           f"  udp={'ON' if cfg.udp_enabled else 'OFF'}"
-          f"  mavlink={'ON' if cfg.mavlink_enabled else 'OFF'}")
+          f"  gps_emu={'ON' if cfg.gps_emu_enabled else 'OFF'}")
     if n_anchors == 3:
         print(f"3 anchor 模式: 高度固定为 z={args.default_height:.2f}m，仅解算 x, y")
     print("等待 UWB 数据...\n")

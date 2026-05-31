@@ -289,10 +289,10 @@ if __name__ == '__main__':
     # ===== 在这里改成你自己的连接方式 =====
     # 例 1: USB 直连飞控  (推荐入门用)
     #CONN = '/dev/ttyACM0';  BAUD = 115200
-    # 例 2: 数传电台
-    # CONN = '/dev/ttyUSB0'; BAUD = 57600
+    # 例 2: 数传电台: WIFI数传
+    #CONN = 'udp:192.168.4.2'; BAUD = 57600
     # 例 3: SITL 仿真 (强烈推荐先用这个调通)
-    CONN = 'udp:127.0.0.1:14551'; BAUD = 115200
+    CONN = 'udp:127.0.0.1:14550'; BAUD = 115200
     # 例 4: Windows
     #CONN = 'COM9'; BAUD = 115200
 

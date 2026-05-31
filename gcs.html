@@ -83,7 +83,8 @@ body { background: var(--bg); color: var(--text); height: 100vh; overflow: hidde
         <label>波特率</label><select id="serial-baud"><option>57600</option><option>115200</option><option>921600</option><option>19200</option><option>9600</option></select>
       </div>
       <div id="udp-args" style="display:none;">
-        <label>主机</label><input id="udp-host" value="192.168.1.100">
+        <label>主机</label><input id="udp-host" value="192.168.1.100" placeholder="无人机IP地址">
+        <div style="font-size:10px;color:var(--muted);margin:2px 0 4px;">连接WiFi数传时改为无人机实际IP</div>
         <label>端口</label><input id="udp-port" value="14550" type="number">
       </div>
       <div class="btn-group">

@@ -58,6 +58,22 @@ def load_uwb_config():
     return {"ok": False, "error": "未找到锚点数据，请先运行 python UWB/uwb.py --calibrate"}
 
 
+def _friendly_socket_error(e, conn_str):
+    """Convert raw socket errors to Chinese troubleshooting messages."""
+    # errno 10049 = WSAEADDRNOTAVAIL on Windows; errno 99 = EADDRNOTAVAIL on Linux
+    if e.errno in (10049, 99):
+        return (
+            "地址不可达 ({})。\n".format(conn_str) +
+            "WiFi数传请确认：① 电脑已连上无人机WiFi热点 ② IP地址输入正确（默认192.168.1.100是示例，请改为实际无人机IP）\n" +
+            "串口连接请确认：串口号和波特率正确"
+        )
+    if e.errno in (10061, 111):  # Connection refused
+        return "连接被拒绝 ({}): 飞控可能未运行或端口不对".format(conn_str)
+    if e.errno in (10060, 110):  # Timeout
+        return "连接超时 ({}): 请检查网络连通性".format(conn_str)
+    return "Socket error ({}): {}".format(conn_str, e)
+
+
 def connect_mavlink(params):
     global mav
     disconnect_mavlink()
@@ -68,8 +84,8 @@ def connect_mavlink(params):
         if conn_type == "serial":
             port = params.get("port", "/dev/ttyUSB0")
             baud = params.get("baud", 57600)
-            conn_str = port
-            master = mavutil.mavlink_connection(conn_str, baud=baud)
+            conn_str = "{} @ {}bps".format(port, baud)
+            master = mavutil.mavlink_connection(port, baud=baud)
         elif conn_type == "udp":
             host = params.get("host", "192.168.1.100")
             port = params.get("port", 14550)
@@ -82,6 +98,10 @@ def connect_mavlink(params):
         # Wait for heartbeat with timeout — SITL may not be running
         print("[MAVLink] Waiting for heartbeat from {} ...".format(conn_str))
         master.wait_heartbeat(timeout=10)
+    except OSError as e:
+        msg = _friendly_socket_error(e, conn_str)
+        print("[MAVLink] {}".format(msg))
+        return {"error": msg}
     except Exception as e:
         msg = "Connection failed: {}".format(e)
         print("[MAVLink] {}".format(msg))

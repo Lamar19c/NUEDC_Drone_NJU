@@ -233,3 +233,24 @@
 
 - **修复前**：标定结果仅存入 `~/.uwb_calib.json`，但 `AnchorConfig._resolve_anchors()` 优先读 `uwb_config.json`，旧锚点值会覆盖标定结果
 - **修复后**：新增 `save_anchors_to_config()`，标定结果直接写入 `uwb_config.json` 的 `anchors` 字段，同时保留缓存文件作为后备
+
+## 2026-05-31
+
+### UWB fake-GPS 输出：NMEA GPS 模拟替换 MAVLink GPS_INPUT
+
+- **协议分析**：收到反馈指出 fake-GPS 数据的接口与真实 GPS 信号传入飞控的接口相同 — 走的是 GPS 串口 (`SERIALx_PROTOCOL=5`)，而非 MAVLink TELEM 口 (`SERIALx_PROTOCOL=1`)。GPS 口期望 NMEA ASCII 文本或 u-blox 二进制，无法解析 MAVLink 帧，存在协议层不匹配
+- **解决方案 B（采用）**：用标准 NMEA 语句 (`$GPGGA` + `$GPRMC`) 替代 MAVLink `GPS_INPUT` 消息，通过 raw pyserial 串口直接发送
+- **新增辅助函数**：
+  - `_deg_to_nmea(lat_e7, lon_e7)` — E7 经纬度 → NMEA `ddmm.mmmm` 度分格式 + 方向指示 (N/S/E/W)
+  - `_nmea_checksum(sentence)` — NMEA XOR 异或校验和
+- **OutputRouter 重写**：
+  - `_init_gps_emulation()` — 使用 `serial.Serial()` 直连，无需 pymavlink
+  - `_send_nmea_sentences()` — 生成并发送 `$GPGGA` (定位) + `$GPRMC` (速度/航向)，限速 5Hz
+  - 移除 `try_read_ekf_origin()` — NMEA 是单向输出（机载计算机→飞控），不能读取 HOME_POSITION；EKF 原点需手动在配置文件中设定
+  - `self.mavlink_conn` → `self._gps_serial` (raw `serial.Serial`)
+  - 速度转换：m/s → knots (×1.94384)；航向：`atan2(vx, vy)` → 真北角度
+- **AnchorConfig 重命名**：`mavlink_enabled/serial_port/serial_baud` → `gps_emu_enabled/serial_port/serial_baud`
+- **配置文件格式**：`output.mavlink` → `output.gps_emulation`，默认波特率从 921600 改为 57600（匹配典型 GPS 模块）
+- **CLI 参数重命名**：`--mavlink-serial` → `--gps-emu-serial`，`--mavlink-baud` → `--gps-emu-baud`，`--no-mavlink` → `--no-gps-emu`
+- **移除功能**：`auto_discover_mavlink_serial()` 函数和 `MAVLINK_BAUD_RATES` 常量 — GPS 端口是输入型，无法通过监听 HEARTBEAT 自动发现
+- **依赖简化**：UWB 定位模块不再依赖 pymavlink（仅 pyserial + numpy 即可，GPS 模拟通过 raw serial 输出）

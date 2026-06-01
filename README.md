@@ -1,26 +1,30 @@
 # 无人机地面站系统
 
-ArduPilot 地面控制站（GCS），支持室内 UWB 定位与室外 GPS 定位双模式，HTML 浏览器端 + Python 桥接后端。
+ArduPilot 地面控制站（GCS），支持室内 UWB 伪 GPS 定位与室外 GPS 定位双模式，HTML 浏览器端 + Python 桥接后端。
 
 ## 项目结构
 
 ```
 main/
-├── gcs_bridge.py          # MAVLink ↔ WebSocket 桥接后端
-├── gcs.html               # 浏览器端地面站前端
-├── drone_mission.py        # MAVLink 单次任务示例脚本
+├── gcs_bridge.py              # MAVLink ↔ WebSocket 桥接后端
+├── gcs.html                   # 浏览器端地面站前端
+├── drone_mission_rectangle.py # MAVLink 矩形航线任务示例脚本
 ├── UWB/
-│   ├── uwb.py              # UWB 室内定位（零配置，自动发现+一键标定）
-│   └── uwb_config.json     # 可选覆盖配置（所有字段可省略）
-├── DEVLOG.md               # 开发日志
-└── CLAUDE.md               # Claude Code 项目指引
+│   ├── uwb.py                 # UWB 室内定位（零配置，自动发现+一键标定）
+│   ├── uwb_config.json        # 可选覆盖配置（所有字段可省略）
+│   └── README.md              # UWB 模块详细文档
+├── docs/
+│   └── hardware-deployment.md # 树莓派部署方案
+├── DEVLOG.md                  # 开发日志
+├── README.md                  # 本文件
+└── CLAUDE.md                  # Claude Code 项目指引
 ```
 
 ## 环境要求
 
 - Python ≥ 3.8
 - 操作系统：Windows 10+ / Ubuntu 20.04+ / Raspberry Pi OS (Bookworm)
-- Linux 需配置串口权限（见下方）
+- Linux 需配置串口权限（`sudo usermod -aG dialout $USER`）
 
 ## 快速开始
 
@@ -30,33 +34,79 @@ main/
 pip install pymavlink websockets pyserial numpy
 ```
 
+> **注意**：`pymavlink` 仅 GCS 桥接和任务脚本需要。UWB 定位模块只需 `pyserial` + `numpy`，不依赖 pymavlink。
+
 ### 2. 启动桥接
 
 ```bash
 python gcs_bridge.py
+# 或指定端口
+python gcs_bridge.py --ws-port 9000
 ```
 
 ### 3. 打开地面站
 
-浏览器打开 `gcs.html`，连接飞控后可使用全部功能。
+浏览器打开 `gcs.html`，选择连接方式（串口/WiFi UDP/SITL），点击连接后可使用全部功能。
 
-### 4. 室内定位（可选）
+---
+
+## 室内 UWB 伪 GPS 定位
+
+### 系统架构
+
+```
+UWB 锚点 S1~S4 ──[$DIST]──→ uwb.py ──NMEA $GPGGA/$GPRMC──→ 飞控 GPS 端口
+                              │
+                              ├── 终端打印 (坐标 + GPS)
+                              └── UDP JSON ──→ gcs_bridge.py ──→ gcs.html
+```
+
+### 接线（仅需 2 根杜邦线）
+
+```
+机载计算机 TX  ──→  飞控 GPS 口 RX
+机载计算机 GND ──→  飞控 GND
+```
+
+> 飞控 GPS 口的 5V、SCK、SDA 不需要连接。5V 是供电输出（两端都是），互接会烧板。
+
+### 使用步骤
 
 ```bash
-# 首次部署：标定锚点（交互式菜单，三种方式可选）
+# 1. 首次部署：标定锚点（交互式菜单，三种方式可选）
 python UWB/uwb.py --calibrate
 
-# 直接设置锚点坐标（已知场地尺寸）
+# 2. 直接设置锚点坐标（已知场地尺寸）
 python UWB/uwb.py --set-anchors "0,0,1.5;2,0,1.5;0,2,1.5;2,2,1.5"
 
-# 日常使用：自动发现串口 + 加载标定结果
-python UWB/uwb.py
+# 3. 日常使用：GPS 模拟输出到飞控
+python UWB/uwb.py --gps-emu-serial /dev/ttyS6 --gps-emu-baud 38400
 
-# 指定飞控 MAVLink 地址
-python UWB/uwb.py --mavlink-host 192.168.1.100:14550
+# Windows 上指定 COM 口
+python UWB/uwb.py --gps-emu-serial COM4 --gps-emu-baud 57600
 ```
 
 标定结果直接写入 `UWB/uwb_config.json`，同时缓存到 `~/.uwb_calib.json` 作为后备。
+
+### 飞控参数配置
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `SERIALx_PROTOCOL` | 5 | GPS 协议（x 为 GPS 口对应的串口号） |
+| `SERIALx_BAUD` | 38 (38400) 或 57 (57600) | 必须与 `--gps-emu-baud` 一致 |
+| `GPS_TYPE` | 1 (AUTO) 或 5 (NMEA) | 飞控按 NMEA 协议解析 |
+| `ekf_origin_lat/lon/alt` | 按实际场地填写 | 在 `uwb_config.json` 中配置 |
+
+### ⚠️ 常见问题：COMPASS not healthy
+
+拔掉外置 GPS 模块后，其内置 I2C 罗盘（SCL/SDA）随之断开，飞控报 `COMPASS not healthy`。
+
+**推荐解决**：校准飞控内置罗盘，然后禁用外置罗盘：
+- `COMPASS_TYPEMASK` — 仅勾选实际存在的 compass
+- `COMPASS_USE2=0`、`COMPASS_USE3=0`
+- 重新做一次罗盘校准（Mission Planner → 初始设置 → 强制校准 → 罗盘）
+
+---
 
 ## 连接方式
 
@@ -70,7 +120,7 @@ python UWB/uwb.py --mavlink-host 192.168.1.100:14550
 
 | | 室内 | 室外 |
 |---|---|---|
-| 定位来源 | UWB 伪 GPS (GPS_INPUT 注入) | 真实 GPS |
+| 定位来源 | UWB 伪 GPS (NMEA 串口注入) | 真实 GPS |
 | 坐标系 | NED (Canvas 网格画布) | GPS (Leaflet 瓦片地图) |
 | 航点显示 | X/Y/Z (米) | 纬度/经度/高度 |
 | 锚点标记 | UWB S1-S4 锚点 | 无 |
@@ -80,7 +130,7 @@ python UWB/uwb.py --mavlink-host 192.168.1.100:14550
 - **混合输入**：地图点击 + 表格编辑双向联动
 - **逐航点参数**：高度、悬停时间、朝向独立设置
 - **两种执行方式**：
-  - 上传飞控：MISSION_ITEM 写入，飞控自主执行
+  - 上传飞控：MISSION_ITEM_INT 写入，飞控自主执行
   - 逐步执行：GCS 逐个下发 SET_POSITION_TARGET_LOCAL_NED
 
 ## 遥测状态栏
@@ -99,7 +149,7 @@ python gcs_bridge.py
 # 浏览器打开 gcs.html → 选 SITL → 连接
 ```
 
-`drone_mission.py` 可同时连 14551 端口，与 GCS 互不干扰。
+`drone_mission_rectangle.py` 可同时连 14551 端口，与 GCS 互不干扰。
 
 ## 部署到树莓派
 
@@ -109,5 +159,5 @@ python gcs_bridge.py
 
 - **前端**：HTML/CSS/JS、Canvas API、Leaflet
 - **后端**：Python、asyncio、websockets、pymavlink
-- **定位**：UWB 三边测量 + EKF 滤波
+- **定位**：UWB 三边测量 + EKF 滤波，NMEA 伪 GPS 串口注入
 - **地图源**：高德 / 必应 / 谷歌 / 腾讯 / OSM

@@ -122,7 +122,7 @@ class AnchorConfig:
             udp_port=udp.get("port", 14550),
             gps_emu_enabled=gps_emu.get("enabled", False),
             gps_emu_serial_port=gps_emu.get("serial_port", "/dev/ttyS6"),
-            gps_emu_serial_baud=gps_emu.get("serial_baud", 57600),
+            gps_emu_serial_baud=gps_emu.get("serial_baud", 38400),
             ekf_origin_lat=lat,
             ekf_origin_lon=lon,
             ekf_origin_alt=alt,
@@ -746,6 +746,10 @@ class OutputRouter:
         self.udp_socket: Optional[socket.socket] = None
         self._gps_serial: Optional[serial.Serial] = None
         self._last_nmea_time: float = 0.0
+        self._nmea_sent_count: int = 0
+        self._nmea_fail_count: int = 0
+        self._nmea_fail_warned: bool = False
+        self._gps_init_failed: bool = False
 
         if config.udp_enabled:
             self._init_udp()
@@ -764,21 +768,32 @@ class OutputRouter:
 
     def _init_gps_emulation(self) -> None:
         """打开串口连接到飞控 GPS 端口（无需 pymavlink）"""
+        port = self.config.gps_emu_serial_port
+        baud = self.config.gps_emu_serial_baud
         try:
             self._gps_serial = serial.Serial(
-                port=self.config.gps_emu_serial_port,
-                baudrate=self.config.gps_emu_serial_baud,
+                port=port,
+                baudrate=baud,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
                 timeout=0,
                 write_timeout=0.5,
             )
-            print(f"NMEA GPS 模拟输出: {self.config.gps_emu_serial_port} "
-                  f"@ {self.config.gps_emu_serial_baud} baud")
+            print(f"NMEA GPS 模拟输出: {port} @ {baud} baud  ✓")
         except Exception as e:
-            print(f"NMEA GPS 串口初始化失败: {e}")
+            print(f"\n{'=' * 55}")
+            print(f"  ⚠ NMEA GPS 串口初始化失败!")
+            print(f"  端口: {port} @ {baud} baud")
+            print(f"  错误: {e}")
+            print(f"  飞控将收不到伪 GPS 信号!")
+            print(f"  请检查:")
+            print(f"    1. 串口设备是否存在 ({port})")
+            print(f"    2. 是否被其他程序占用")
+            print(f"    3. 是否有读写权限")
+            print(f"{'=' * 55}\n")
             self._gps_serial = None
+            self._gps_init_failed = True
 
     # ---- 位置输出 ----
 
@@ -791,8 +806,18 @@ class OutputRouter:
         ts = time.strftime("%H:%M:%S", time.localtime(timestamp))
 
         if self.config.output_terminal:
+            lat_e7, lon_e7, alt_mm = local_to_gps(
+                x, y, z,
+                self.config.ekf_origin_lat,
+                self.config.ekf_origin_lon,
+                self.config.ekf_origin_alt,
+            )
+            lat_deg = lat_e7 / 1e7
+            lon_deg = lon_e7 / 1e7
+            alt_m = alt_mm / 1000.0
             print(f"[{ts}] x={x:+.2f}, y={y:+.2f}, z={z:+.2f}  "
-                  f"vx={vx:+.2f}, vy={vy:+.2f}, vz={vz:+.2f}")
+                  f"vx={vx:+.2f}, vy={vy:+.2f}, vz={vz:+.2f}  "
+                  f"GPS: {lat_deg:.7f},{lon_deg:.7f},{alt_m:.2f}m")
 
         if self.udp_socket:
             payload = json.dumps({
@@ -817,6 +842,10 @@ class OutputRouter:
                               timestamp: float) -> None:
         """生成并发送 $GPGGA + $GPRMC NMEA 语句到飞控 GPS 端口"""
         if not self._gps_serial or not self._gps_serial.is_open:
+            # 串口未就绪，首次告警一次
+            if self.config.gps_emu_enabled and not self._gps_init_failed:
+                print("  ⚠ NMEA 串口已断开，GPS 模拟中断")
+                self._gps_init_failed = True
             return
 
         # 限速：不超过 NMEA_RATE_HZ
@@ -849,21 +878,41 @@ class OutputRouter:
         if course < 0:
             course += 360
 
-        # 5. 组装并发送
-        try:
-            # $GPGGA — 定位数据
-            ggpa = f"$GPGGA,{time_str}.00,{lat_str},{lat_dir},{lon_str},{lon_dir}," \
-                   f"1,08,1.0,{alt_m:.1f},M,0.0,M,,"
-            ggpa += f"*{_nmea_checksum(ggpa)}\r\n"
-            self._gps_serial.write(ggpa.encode("ascii"))
+        # 5. 组装 NMEA 语句
+        ggpa = f"$GPGGA,{time_str}.00,{lat_str},{lat_dir},{lon_str},{lon_dir}," \
+               f"1,08,1.0,{alt_m:.1f},M,0.0,M,,"
+        ggpa = f"{ggpa}*{_nmea_checksum(ggpa)}\r\n"
 
-            # $GPRMC — 最小推荐数据（含速度/航向）
-            rmc = f"$GPRMC,{time_str}.00,A,{lat_str},{lat_dir},{lon_str},{lon_dir}," \
-                  f"{speed_kn:.2f},{course:.1f},{date_str},,,A"
-            rmc += f"*{_nmea_checksum(rmc)}\r\n"
+        rmc = f"$GPRMC,{time_str}.00,A,{lat_str},{lat_dir},{lon_str},{lon_dir}," \
+              f"{speed_kn:.2f},{course:.1f},{date_str},,,A"
+        rmc = f"{rmc}*{_nmea_checksum(rmc)}\r\n"
+
+        # 6. 发送
+        try:
+            self._gps_serial.write(ggpa.encode("ascii"))
             self._gps_serial.write(rmc.encode("ascii"))
-        except (OSError, serial.SerialException):
-            pass  # 串口写入失败（断连等），静默跳过
+            self._nmea_sent_count += 1
+            self._nmea_fail_count = 0
+            self._gps_init_failed = False  # 写入成功，清除故障标记
+
+            # 首条 NMEA 打印到终端，方便验证格式
+            if self._nmea_sent_count == 1:
+                print(f"\n  ✓ NMEA 首条已发送:")
+                print(f"    {ggpa.strip()}")
+                print(f"    {rmc.strip()}\n")
+
+            # 定期心跳 (每 ~5s = 每 25 条 @ 5Hz)
+            if self._nmea_sent_count % 25 == 0:
+                print(f"  📡 NMEA 已发送 {self._nmea_sent_count} 组 → "
+                      f"{self.config.gps_emu_serial_port} "
+                      f"({lat_e7/1e7:.7f},{lon_e7/1e7:.7f})")
+
+        except (OSError, serial.SerialException) as e:
+            self._nmea_fail_count += 1
+            if not self._nmea_fail_warned and self._nmea_fail_count >= 3:
+                print(f"  ⚠ NMEA 串口写入失败 (已连续 {self._nmea_fail_count} 次): {e}")
+                print(f"    检查 {self.config.gps_emu_serial_port} 是否仍然连接")
+                self._nmea_fail_warned = True
 
     # ---- 清理 ----
 

@@ -254,3 +254,39 @@
 - **CLI 参数重命名**：`--mavlink-serial` → `--gps-emu-serial`，`--mavlink-baud` → `--gps-emu-baud`，`--no-mavlink` → `--no-gps-emu`
 - **移除功能**：`auto_discover_mavlink_serial()` 函数和 `MAVLINK_BAUD_RATES` 常量 — GPS 端口是输入型，无法通过监听 HEARTBEAT 自动发现
 - **依赖简化**：UWB 定位模块不再依赖 pymavlink（仅 pyserial + numpy 即可，GPS 模拟通过 raw serial 输出）
+
+## 2026-06-01
+
+### UWB 伪 GPS — 地面站成功接收 GPS 数据
+
+- **验证通过**：UWB NMEA 伪 GPS 信号经串口送达飞控 GPS 端口，地面站 (Mission Planner) 已成功显示 GPS 定位数据
+- **接线确认**：机载 TX → 飞控 RX，机载 GND → 飞控 GND（仅需 2 根杜邦线）
+- **飞控参数确认**：
+  - `SERIALx_PROTOCOL=5` (GPS 协议)
+  - `SERIALx_BAUD` 与 `uwb.py --gps-emu-baud` 一致 (默认 38400)
+  - `GPS_TYPE=1` (AUTO) 或 `5` (NMEA)
+
+### 终端 GPS 坐标显示
+
+- `OutputRouter.output_position()` 终端输出增加 GPS 坐标：每行尾部追加 `GPS: lat,lon,alt_m`
+- 转换调用 `local_to_gps()` 与 NMEA 发送同源，方便调试时肉眼验证
+
+### NMEA 输出诊断增强
+
+- **串口初始化失败 → 醒目错误框**：之前仅一行小字 `NMEA GPS 串口初始化失败`，易被坐标刷屏淹没。现改为多行框体，明确指出端口、错误原因、排查建议
+- **首条 NMEA 打印到终端**：第一条成功发送的 `$GPGGA` + `$GPRMC` 完整打印，可肉眼校验语句格式和校验和
+- **定期心跳**：每 ~5s (每 25 条 @ 5Hz) 打印 `📡 NMEA 已发送 N 组 → COMx (lat,lon)`
+- **写入失败告警**：串口写入连续失败 3 次后打印警告，不再静默吞异常
+- **新增状态追踪字段**：`_nmea_sent_count`、`_nmea_fail_count`、`_nmea_fail_warned`、`_gps_init_failed`
+
+### ⚠ 待解决：COMPASS not healthy
+
+- **现象**：地面站报 `COMPASS not healthy`，飞控检测不到罗盘
+- **根因**：UWB 伪 GPS 模式下拔掉了外置 GPS 模块（如 M9N），该模块内置的 I2C 罗盘（SCL/SDA 引脚）随之断开。飞控预期 GPS 口上有外置罗盘，检测不到即报 unhealthy
+- **解决方案（三选一，推荐方案 A）**：
+  - **方案 A**：校准飞控内置罗盘 + 禁用外置罗盘
+    - `COMPASS_TYPEMASK` — 仅勾选实际存在的 compass（通常是内部 I2C），取消不存在的外部罗盘
+    - `COMPASS_USE=1`、`COMPASS_USE2=0`、`COMPASS_USE3=0`
+    - 重新做一次罗盘校准
+  - **方案 B**：保留 GPS 模块的 5V/GND/SCL/SDA 接线（仅断开 TX/RX 改接机载计算机），让罗盘保持在线上
+  - **方案 C**：临时跳过（仅地面测试用，不实飞）— `ARMING_CHECK` 去掉 compass 检查位

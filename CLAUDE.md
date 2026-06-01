@@ -109,7 +109,7 @@ Non-interactive equivalents: `--cal-points "x,y,z;..."` and `--set-anchors "x,y,
 
 **Calibration persistence**: Results saved to `uwb_config.json` directly (primary), with `~/.uwb_calib.json` as backup.
 
-**Output channels**: Terminal (always on), UDP JSON broadcast (`127.0.0.1:14550` default), NMEA GPS emulation (serial NMEA sentences to FC GPS port). NMEA is output-only — HOME_POSITION cannot be auto-read; configure `ekf_origin_lat/lon/alt` manually in config.
+**Output channels**: Terminal (always on), UDP JSON broadcast (`127.0.0.1:14550` default), NMEA GPS emulation (serial NMEA sentences to FC GPS port). NMEA is output-only — HOME_POSITION cannot be auto-read; configure `ekf_origin_lat/lon/alt` manually in config. Default baud 38400, matching u-blox NEO-M9N default.
 
 ### Mission Script (`drone_mission_rectangle.py`)
 

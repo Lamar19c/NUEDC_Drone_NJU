@@ -329,4 +329,3 @@
 #### 协方差更新稳定性提升
 
 - `P = (I-KH) @ P` 简化形式 → `P = (I-KH) @ P @ (I-KH)ᵀ + K @ R @ Kᵀ` Joseph 形式，保证 P 始终对称正定
-- `_solve_2d()` 中硬编码 `for i in range(1, 3)` → `for i in range(1, len(anchors))`，支持 3+ 锚点参与 2D 求解

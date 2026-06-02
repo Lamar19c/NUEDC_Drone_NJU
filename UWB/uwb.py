@@ -624,10 +624,12 @@ class UWBSolver:
         d0 = d[0]
         p0_norm_sq = np.dot(p0, p0)
 
-        A = np.zeros((len(anchors) - 1, 2))
-        b = np.zeros(len(anchors) - 1)
+        # _solve_2d is only called when exactly 3 anchors respond
+        # (4+ anchors → _solve_3d for full 3D solution)
+        A = np.zeros((2, 2))
+        b = np.zeros(2)
 
-        for i in range(1, len(anchors)):
+        for i in range(1, 3):
             pi = anchors[i]
             rhs = (d0 * d0 - d[i] * d[i]
                    - p0_norm_sq + np.dot(pi, pi)

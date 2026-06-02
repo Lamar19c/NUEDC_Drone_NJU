@@ -462,47 +462,92 @@ def _parse_points_arg(arg: str) -> list:
 
 
 class UWBEKF:
-    """扩展卡尔曼滤波，状态 [x, y, z, vx, vy, vz]"""
+    """扩展卡尔曼滤波，状态 [x, y, z, vx, vy, vz]
 
-    def __init__(self, process_noise: float = 0.01, measurement_noise: float = 0.1):
+    Parameters
+    ----------
+    measurement_noise : float
+        测量噪声方差 (m²)，默认 0.1 → σ_meas ≈ 0.32 m
+    accel_noise : float
+        加速度过程噪声功率谱密度 (m²/s³)，控制速度平滑强度。
+        值越小→速度越平滑但响应越慢。默认 0.5（适用于步行~慢速无人机）。
+    """
+
+    def __init__(self, measurement_noise: float = 0.1, accel_noise: float = 0.5):
         self.x = np.zeros((6, 1))
         self.P = np.eye(6) * 0.1
-        self.Q = np.eye(6) * process_noise
         self.R = np.eye(3) * measurement_noise
+        self._accel_noise = accel_noise
         self._initialized = False
 
-    def predict(self, dt: float = 0.1) -> None:
+    def predict(self, dt: float) -> None:
+        """匀速模型状态预测，dt 为实际时间步长（秒）"""
+        # ── 状态转移 ──
         F = np.eye(6)
         F[0, 3] = dt
         F[1, 4] = dt
         F[2, 5] = dt
         self.x = F @ self.x
-        self.P = F @ self.P @ F.T + self.Q
+
+        # ── 过程噪声 Q：连续白噪声加速度模型 (CWNA) ──
+        #  Q_block = [[dt³/3, dt²/2],
+        #             [dt²/2, dt   ]] * q     (per axis)
+        q = self._accel_noise
+        dt2 = dt * dt
+        dt3_3 = dt2 * dt / 3.0
+        dt2_2 = dt2 / 2.0
+
+        Q = np.zeros((6, 6))
+        for i in range(3):  # x, y, z axes
+            Q[i, i] = dt3_3 * q
+            Q[i, i + 3] = dt2_2 * q
+            Q[i + 3, i] = dt2_2 * q
+            Q[i + 3, i + 3] = dt * q
+
+        self.P = F @ self.P @ F.T + Q
 
     def update(self, z_meas: np.ndarray) -> None:
         H = np.array([[1, 0, 0, 0, 0, 0],
                        [0, 1, 0, 0, 0, 0],
                        [0, 0, 1, 0, 0, 0]])
+
+        if not self._initialized:
+            # 首帧直接设位置，避免零初态导致的虚假速度尖峰
+            self.x[0, 0] = z_meas[0]
+            self.x[1, 0] = z_meas[1]
+            self.x[2, 0] = z_meas[2]
+            self._initialized = True
+            return
+
         y = z_meas.reshape(3, 1) - H @ self.x
         S = H @ self.P @ H.T + self.R
         K = self.P @ H.T @ np.linalg.inv(S)
         self.x = self.x + K @ y
-        self.P = (np.eye(6) - K @ H) @ self.P
-        self._initialized = True
+        # Joseph 形式 + 对称化防止浮点累积
+        I_KH = np.eye(6) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ self.R @ K.T
 
     def update_2d(self, z_meas: np.ndarray, fixed_z: float) -> None:
         """2D 更新：仅更新 x, y，z 固定为 fixed_z，vz 清零"""
         H = np.array([[1, 0, 0, 0, 0, 0],
                        [0, 1, 0, 0, 0, 0]])
+
+        if not self._initialized:
+            self.x[0, 0] = z_meas[0]
+            self.x[1, 0] = z_meas[1]
+            self.x[2, 0] = fixed_z
+            self._initialized = True
+            return
+
         y_vec = z_meas.reshape(2, 1) - H @ self.x
         R_2d = self.R[:2, :2]
         S = H @ self.P @ H.T + R_2d
         K = self.P @ H.T @ np.linalg.inv(S)
         self.x = self.x + K @ y_vec
-        self.P = (np.eye(6) - K @ H) @ self.P
+        I_KH = np.eye(6) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R_2d @ K.T
         self.x[2, 0] = fixed_z
         self.x[5, 0] = 0.0
-        self._initialized = True
 
     @property
     def position(self) -> tuple:
@@ -517,28 +562,37 @@ class UWBSolver:
     """四球面交汇求解器（3 anchor 时退化为固定高度的 2D 求解）"""
 
     def __init__(self, anchor_positions: np.ndarray,
-                 process_noise: float = 0.01,
                  measurement_noise: float = 0.1,
+                 accel_noise: float = 0.5,
                  default_height: float = 1.0):
         self.anchors = anchor_positions
         self.default_height = default_height
-        self.ekf = UWBEKF(process_noise, measurement_noise)
+        self.ekf = UWBEKF(measurement_noise, accel_noise)
         self._mode_2d = False
+        self._last_t: float = 0.0
 
     def solve(self, distances: list) -> Optional[tuple]:
-        if len(distances) < 3:
+        # Filter out None entries (missing anchors) while preserving anchor ↦ distance mapping
+        valid_indices = [i for i, d in enumerate(distances) if d is not None]
+        if len(valid_indices) < 3:
             return None
 
-        n = len(distances)
-        anchors = self.anchors[:n]
-        d = np.array(distances, dtype=float)
+        anchors = self.anchors[valid_indices]
+        d = np.array([distances[i] for i in valid_indices], dtype=float)
 
-        if n == 3:
-            return self._solve_2d(anchors, d)
+        # Compute actual dt since last solve
+        now = time.time()
+        dt = now - self._last_t if self._last_t > 0 else 0.1
+        self._last_t = now
+        # Clamp dt to a reasonable range to avoid singularity after pauses
+        dt = max(0.02, min(dt, 2.0))
+
+        if len(valid_indices) == 3:
+            return self._solve_2d(anchors, d, dt)
         else:
-            return self._solve_3d(anchors, d)
+            return self._solve_3d(anchors, d, dt)
 
-    def _solve_3d(self, anchors: np.ndarray, d: np.ndarray) -> Optional[tuple]:
+    def _solve_3d(self, anchors: np.ndarray, d: np.ndarray, dt: float) -> Optional[tuple]:
         self._mode_2d = False
         p0 = anchors[0]
         d0 = d[0]
@@ -556,24 +610,24 @@ class UWBSolver:
         result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
 
         z_meas = np.array(result)
-        self.ekf.predict()
+        self.ekf.predict(dt)
         self.ekf.update(z_meas)
 
         x, y, z = self.ekf.position
         vx, vy, vz = self.ekf.velocity
         return (x, y, z, vx, vy, vz)
 
-    def _solve_2d(self, anchors: np.ndarray, d: np.ndarray) -> Optional[tuple]:
+    def _solve_2d(self, anchors: np.ndarray, d: np.ndarray, dt: float) -> Optional[tuple]:
         self._mode_2d = True
         fixed_z = self.default_height
         p0 = anchors[0]
         d0 = d[0]
         p0_norm_sq = np.dot(p0, p0)
 
-        A = np.zeros((2, 2))
-        b = np.zeros(2)
+        A = np.zeros((len(anchors) - 1, 2))
+        b = np.zeros(len(anchors) - 1)
 
-        for i in range(1, 3):
+        for i in range(1, len(anchors)):
             pi = anchors[i]
             rhs = (d0 * d0 - d[i] * d[i]
                    - p0_norm_sq + np.dot(pi, pi)
@@ -584,7 +638,7 @@ class UWBSolver:
         result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
 
         z_meas = np.array([result[0], result[1]])
-        self.ekf.predict()
+        self.ekf.predict(dt)
         self.ekf.update_2d(z_meas, fixed_z)
 
         x, y, z = self.ekf.position
@@ -667,10 +721,9 @@ class SerialReader:
                 if chunk:
                     self._feed_data(chunk)
                 if len(self._distances) >= 3:
-                    result = []
-                    for i in range(1, 5):
-                        if i in self._distances:
-                            result.append(self._distances[i])
+                    # Preserve anchor ID → distance mapping: always 4 elements (S1..S4),
+                    # None for anchors that haven't reported this cycle.
+                    result = [self._distances.get(i) for i in range(1, 5)]
                     self._distances.clear()
                     return result
             except Exception:

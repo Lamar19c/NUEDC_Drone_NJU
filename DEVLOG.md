@@ -290,3 +290,43 @@
     - 重新做一次罗盘校准
   - **方案 B**：保留 GPS 模块的 5V/GND/SCL/SDA 接线（仅断开 TX/RX 改接机载计算机），让罗盘保持在线上
   - **方案 C**：临时跳过（仅地面测试用，不实飞）— `ARMING_CHECK` 去掉 compass 检查位
+
+## 2026-06-02
+
+### Bug 修复 — EKF 卡尔曼滤波算法审查与修复
+
+对 `UWB/uwb.py` 中 `UWBEKF` + `UWBSolver` + `SerialReader` 进行了系统性审查，发现并修复 4 个问题：
+
+#### 🔴 Bug 1（严重）：距离-锚点 ID 失配 — `SerialReader.read_distances()`
+
+- **根因**：`read_distances()` 在某个锚点未响应时（如 S3 丢失），返回跳过缺失 ID 的压缩列表 `[d1, d2, d4]`（3 元素），但 `UWBSolver.solve()` 按 `anchors[:3]` 取 S1/S2/S3 的坐标，导致 S4 的距离错误配对到 S3 的位置
+- **修复**：返回列表改为 `[self._distances.get(i) for i in range(1, 5)]`，始终 4 元素，缺失锚点填 `None`；`solve()` 中按 `valid_indices` 精确匹配距离与锚点坐标
+- **验证**：数值测试证实旧 bug 在 S3 缺失时产生 0.75m 定位误差
+
+#### 🟡 Bug 2（中等）：`predict()` 中 dt 固定为 0.1
+
+- **根因**：`UWBEKF.predict(dt=0.1)` 始终使用默认值，不追踪实际时间间隔。若 UWB 数据率非 10Hz，速度预测会有系统性偏差
+- **修复**：
+  - `predict()` 移除默认值，`dt` 改为必传参数
+  - `UWBSolver` 新增 `_last_t` 属性，`solve()` 中计算实际 `dt = now - _last_t`，钳制到 [0.02, 2.0] 防止暂停后异常跳变
+
+#### 🟡 Issue 3（次要）：过程噪声 Q 矩阵过于简化
+
+- **根因**：`Q = I * process_noise` 用统一标量对角阵，忽略了位置/速度噪声的不同物理量纲
+- **修复**：采用连续白噪声加速度模型 (CWNA) 推导的标准形式：
+  ```
+  Q_block = [[dt³/3, dt²/2],
+             [dt²/2, dt   ]] * q    (每轴)
+  ```
+  新增 `accel_noise` 参数（加速度噪声 PSD，单位 m²/s³，默认 0.5），Q 矩阵在每次 `predict()` 中根据实际 dt 动态计算
+- **API 变更**：`UWBSolver(process_noise, measurement_noise, ...)` → `UWBSolver(measurement_noise, accel_noise, ...)`
+
+#### 🟢 Issue 4（轻微）：EKF 无初始化门控
+
+- **根因**：`_initialized` 标志只写不读，滤波器从零初态 `x=[0,0,0,0,0,0]` 启动，首帧 innovation 很大导致状态突跳
+- **修复**：`update()` 和 `update_2d()` 中增加初始化分支 — 首帧直接设位置（跳过 KF 更新），后续帧才走标准 Kalman 更新
+
+#### 协方差更新稳定性提升
+
+- `P = (I-KH) @ P` 简化形式 → `P = (I-KH) @ P @ (I-KH)ᵀ + K @ R @ Kᵀ` Joseph 形式，保证 P 始终对称正定
+- `_solve_2d()` 中硬编码 `for i in range(1, 3)` → `for i in range(1, len(anchors))`，支持 3+ 锚点参与 2D 求解

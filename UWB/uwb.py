@@ -467,15 +467,15 @@ class UWBEKF:
     Parameters
     ----------
     measurement_noise : float
-        测量噪声方差 (m²)，默认 0.1 → σ_meas ≈ 0.32 m
+        测量噪声方差 (m²)，默认 0.01 → σ_meas ≈ 0.1 m
     accel_noise : float
         加速度过程噪声功率谱密度 (m²/s³)，控制速度平滑强度。
         值越小→速度越平滑但响应越慢。默认 0.5（适用于步行~慢速无人机）。
     """
 
-    def __init__(self, measurement_noise: float = 0.1, accel_noise: float = 0.5):
+    def __init__(self, measurement_noise: float = 0.01, accel_noise: float = 0.5):
         self.x = np.zeros((6, 1))
-        self.P = np.eye(6) * 0.1
+        self.P = np.eye(6) * 0.01
         self.R = np.eye(3) * measurement_noise
         self._accel_noise = accel_noise
         self._initialized = False
@@ -562,7 +562,7 @@ class UWBSolver:
     """四球面交汇求解器（3 anchor 时退化为固定高度的 2D 求解）"""
 
     def __init__(self, anchor_positions: np.ndarray,
-                 measurement_noise: float = 0.1,
+                 measurement_noise: float = 0.01,
                  accel_noise: float = 0.5,
                  default_height: float = 1.0):
         self.anchors = anchor_positions

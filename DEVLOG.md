@@ -329,3 +329,18 @@
 #### 协方差更新稳定性提升
 
 - `P = (I-KH) @ P` 简化形式 → `P = (I-KH) @ P @ (I-KH)ᵀ + K @ R @ Kᵀ` Joseph 形式，保证 P 始终对称正定
+
+## 2026-06-03
+
+### UWB EKF 测量噪声方差调优
+
+- **变更**：EKF 测量噪声方差 `measurement_noise` 从 `0.1` 降低为 `0.01`（m²）
+- **影响**：
+  - 测量标准差 σ 从 ~0.32 m 降至 ~0.10 m
+  - 滤波器对原始 UWB 测距值的信任度提升 **10 倍**，更紧密跟踪测量值
+  - 噪声抑制减弱、响应速度提升 — 适用于高精度 UWB 锚点部署场景
+- **修改位置**（`UWB/uwb.py`）：
+  - `UWBEKF.__init__()` 默认参数：`measurement_noise: float = 0.01`
+  - `UWBSolver.__init__()` 默认参数：`measurement_noise: float = 0.01`
+  - EKF 初始协方差 `self.P`：`np.eye(6) * 0.01`（与原噪声水平保持一致）
+  - 文档字符串：`σ_meas ≈ 0.32 m` → `σ_meas ≈ 0.1 m`

@@ -215,4 +215,210 @@ static void pos_filter_apply(struct PositionFilter *pf, float *x, float *y, floa
     }
 }
 
+/* ========================================================================
+ * 4. UWBSolver — 加权最小二乘三边测量 (中值滤波替代 EKF)
+ * ======================================================================== */
+
+struct UWBSolver {
+    const float (*anchors)[3];
+    int           anchor_count;
+    int           mode_2d;
+    unsigned long last_t;
+    struct PositionFilter pos_filter;
+    float         last_x, last_y, last_z;
+    int           has_last_pos;
+};
+
+/* ---- 4a. 3x3 线性方程组 (Cramer 法则) ---- */
+
+static int solve3x3(float out[3], const float A[9], const float b[3]) {
+    float det = A[0] * (A[4] * A[8] - A[5] * A[7])
+              - A[1] * (A[3] * A[8] - A[5] * A[6])
+              + A[2] * (A[3] * A[7] - A[4] * A[6]);
+
+    if (fabsf(det) < 1e-10f) return 0;
+
+    float inv_det = 1.0f / det;
+
+    out[0] = (b[0] * (A[4] * A[8] - A[5] * A[7])
+           -  A[1] * (b[1] * A[8] - A[5] * b[2])
+           +  A[2] * (b[1] * A[7] - A[4] * b[2])) * inv_det;
+
+    out[1] = (A[0] * (b[1] * A[8] - A[5] * b[2])
+           -  b[0] * (A[3] * A[8] - A[5] * A[6])
+           +  A[2] * (A[3] * b[2] - b[1] * A[6])) * inv_det;
+
+    out[2] = (A[0] * (A[4] * b[2] - b[1] * A[7])
+           -  A[1] * (A[3] * b[2] - b[1] * A[6])
+           +  b[0] * (A[3] * A[7] - A[4] * A[6])) * inv_det;
+
+    return 1;
+}
+
+static void uwb_solver_init(struct UWBSolver *s, const float anchors[][3], int count) {
+    s->anchors = anchors;
+    s->anchor_count = count;
+    s->last_t = 0;
+    s->mode_2d = 0;
+    s->last_x = s->last_y = s->last_z = 0.0f;
+    s->has_last_pos = 0;
+    pos_filter_init(&s->pos_filter);
+}
+
+/* ---- 4b. 2D 求解 (3 锚点降级, Z 固定 DEFAULT_HEIGHT) ---- */
+
+static int solve_2d(struct UWBSolver *s, const int idx[], const float dist[],
+                    float *out_x, float *out_y, float *out_z) {
+    float fixed_z = DEFAULT_HEIGHT;
+
+    int i0 = idx[0], i1 = idx[1], i2 = idx[2];
+    float p0x = s->anchors[i0][0], p0y = s->anchors[i0][1], p0z = s->anchors[i0][2];
+    float p1x = s->anchors[i1][0], p1y = s->anchors[i1][1], p1z = s->anchors[i1][2];
+    float p2x = s->anchors[i2][0], p2y = s->anchors[i2][1], p2z = s->anchors[i2][2];
+
+    float d0 = dist[i0], d1 = dist[i1], d2 = dist[i2];
+    float p0_norm_sq = p0x * p0x + p0y * p0y + p0z * p0z;
+
+    float w1 = 1.0f / (d1 + 0.1f);
+    float w2 = 1.0f / (d2 + 0.1f);
+
+    float A00 = 2.0f * (p1x - p0x) * w1;
+    float A01 = 2.0f * (p1y - p0y) * w1;
+    float A10 = 2.0f * (p2x - p0x) * w2;
+    float A11 = 2.0f * (p2y - p0y) * w2;
+
+    float p1_norm_sq = p1x * p1x + p1y * p1y + p1z * p1z;
+    float p2_norm_sq = p2x * p2x + p2y * p2y + p2z * p2z;
+
+    float b0 = (d0 * d0 - d1 * d1 - p0_norm_sq + p1_norm_sq
+                - 2.0f * (p1z - p0z) * fixed_z) * w1;
+    float b1 = (d0 * d0 - d2 * d2 - p0_norm_sq + p2_norm_sq
+                - 2.0f * (p2z - p0z) * fixed_z) * w2;
+
+    float ATA0 = A00 * A00 + A10 * A10;
+    float ATA1 = A00 * A01 + A10 * A11;
+    float ATA3 = A01 * A01 + A11 * A11;
+
+    float det = ATA0 * ATA3 - ATA1 * ATA1;
+    if (fabsf(det) < 1e-10f) return 0;
+
+    float ATb0 = A00 * b0 + A10 * b1;
+    float ATb1 = A01 * b0 + A11 * b1;
+
+    float inv_det = 1.0f / det;
+    float rx = ( ATA3 * ATb0 - ATA1 * ATb1) * inv_det;
+    float ry = (-ATA1 * ATb0 + ATA0 * ATb1) * inv_det;
+
+    if (fabsf(rx) > 100.0f || fabsf(ry) > 100.0f) return 0;
+
+    *out_x = (rx < POS_CLAMP_MIN) ? POS_CLAMP_MIN : ((rx > POS_CLAMP_MAX) ? POS_CLAMP_MAX : rx);
+    *out_y = (ry < POS_CLAMP_MIN) ? POS_CLAMP_MIN : ((ry > POS_CLAMP_MAX) ? POS_CLAMP_MAX : ry);
+    *out_z = fixed_z;
+    return 1;
+}
+
+/* ---- 4c. 3D 求解 (4+ 锚点, 加权正规方程 + Cramer) ---- */
+
+static int solve_3d(struct UWBSolver *s, const int idx[], const float dist[], int n,
+                    float *out_x, float *out_y, float *out_z) {
+    int i0 = idx[0];
+    float p0x = s->anchors[i0][0], p0y = s->anchors[i0][1], p0z = s->anchors[i0][2];
+    float d0 = dist[i0];
+    float p0_norm_sq = p0x * p0x + p0y * p0y + p0z * p0z;
+
+    int m = n - 1;  /* number of equations */
+    float ATA[9] = {0};
+    float ATb[3] = {0};
+
+    for (int j = 0; j < m; j++) {
+        int ij = idx[j + 1];
+        float px = s->anchors[ij][0], py = s->anchors[ij][1], pz = s->anchors[ij][2];
+        float dj = dist[ij];
+
+        float w = 1.0f / (dj + 0.1f);
+
+        float a0 = 2.0f * (px - p0x) * w;
+        float a1 = 2.0f * (py - p0y) * w;
+        float a2 = 2.0f * (pz - p0z) * w;
+
+        float pj_norm_sq = px * px + py * py + pz * pz;
+        float bj = (d0 * d0 - dj * dj - p0_norm_sq + pj_norm_sq) * w;
+
+        ATA[0] += a0 * a0;  ATA[1] += a0 * a1;  ATA[2] += a0 * a2;
+        ATA[3] += a1 * a0;  ATA[4] += a1 * a1;  ATA[5] += a1 * a2;
+        ATA[6] += a2 * a0;  ATA[7] += a2 * a1;  ATA[8] += a2 * a2;
+
+        ATb[0] += a0 * bj;
+        ATb[1] += a1 * bj;
+        ATb[2] += a2 * bj;
+    }
+
+    float result[3];
+    if (!solve3x3(result, ATA, ATb)) return 0;
+
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(result[i]) > 100.0f) return 0;
+    }
+
+    *out_x = (result[0] < POS_CLAMP_MIN) ? POS_CLAMP_MIN : ((result[0] > POS_CLAMP_MAX) ? POS_CLAMP_MAX : result[0]);
+    *out_y = (result[1] < POS_CLAMP_MIN) ? POS_CLAMP_MIN : ((result[1] > POS_CLAMP_MAX) ? POS_CLAMP_MAX : result[1]);
+    *out_z = (result[2] < POS_CLAMP_MIN) ? POS_CLAMP_MIN : ((result[2] > POS_CLAMP_MAX) ? POS_CLAMP_MAX : result[2]);
+    return 1;
+}
+
+/* ---- 4d. 求解入口 — 收集有效锚点 → 三边测量 → 中值滤波 → 速度 ---- */
+
+static int uwb_solver_solve(struct UWBSolver *s, const float distances[],
+                            unsigned long now_ms,
+                            float *x, float *y, float *z,
+                            float *vx, float *vy, float *vz) {
+    /* collect valid anchors */
+    int valid_idx[8];
+    int valid_cnt = 0;
+    for (int i = 0; i < s->anchor_count; i++) {
+        if (distances[i] > 0.0f && distances[i] < 50.0f) {
+            valid_idx[valid_cnt++] = i;
+        }
+    }
+    if (valid_cnt < 3) return 0;
+
+    /* compute dt */
+    float dt = 0.1f;
+    if (s->last_t > 0) {
+        dt = (float)(now_ms - s->last_t) / 1000.0f;
+    }
+    s->last_t = now_ms;
+    if (dt < 0.02f) dt = 0.02f;
+    if (dt > 2.0f)  dt = 2.0f;
+
+    /* save previous position for velocity */
+    float prev_x = s->last_x, prev_y = s->last_y, prev_z = s->last_z;
+    int had_prev = s->has_last_pos;
+
+    /* trilateration */
+    if (valid_cnt == 3) {
+        if (!solve_2d(s, valid_idx, distances, x, y, z)) return 0;
+    } else {
+        if (!solve_3d(s, valid_idx, distances, valid_cnt, x, y, z)) return 0;
+    }
+
+    /* position median filter */
+    pos_filter_apply(&s->pos_filter, x, y, z);
+
+    /* store filtered position */
+    s->last_x = *x; s->last_y = *y; s->last_z = *z;
+    s->has_last_pos = 1;
+
+    /* finite-difference velocity */
+    if (had_prev && dt > 0.001f) {
+        *vx = (*x - prev_x) / dt;
+        *vy = (*y - prev_y) / dt;
+        *vz = (*z - prev_z) / dt;
+    } else {
+        *vx = *vy = *vz = 0.0f;
+    }
+
+    return 1;
+}
+
 #endif /* UWB_SOLVER_H */

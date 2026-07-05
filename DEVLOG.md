@@ -402,6 +402,93 @@
 - 删除 `docs/hardware/anchor_mesh.c/h` (HC-42 BLE 方案已放弃)
 - 删除 `docs/hardware/jzm01_compat.c` (JZM01 兼容层不再需要)
 
+## 2026-07-06
+
+### STM32F103C8T6 UWB 定位模块 — 纯 C 移植
+
+- **动机**：当前 Python UWB 方案依赖机载计算机（Pi/旭日X3），成本高、重量大。将定位解算下沉到 ¥12 单片机，取消机载计算机依赖。
+- **设计讨论**：对比 STM32duino / PlatformIO / CubeMX+HAL 三种框架，选 CubeMX+HAL 裸机；对比 C++ class / C++桥接 / 纯C，选纯 C（CubeMX 生态一致，无桥接开销）；对比 EKF / 中值滤波，选双中值滤波（M3 内核无 FPU，整数运算更合适）。
+- **锚点策略**：硬编码坐标，无需现场标定，上电即用。
+
+### `uwb_config.h` — 纯 C 配置头文件
+
+- Arduino `uwb_arduino/uwb_config.h` → C 版，删 `#include <Arduino.h>`
+- 添加 `POS_WINDOW_SIZE` (从 Arduino class 提取为全局 define)
+- 添加 `RAD_TO_DEG` / `DEG_TO_RAD` (Arduino 宏替代)
+- `GPS_ORIGIN_ALT` 注释修正：1200 cm = 12.0 m，非 120.0 m
+
+### `uwb_solver.h` — C struct 改写 (424 行)
+
+Arduino C++ class → C struct + 独立函数，算法逻辑不变：
+
+| C++ (Arduino 版) | C (STM32 版) |
+|---|---|
+| `class UWB_Parser { ... };` | `struct UWB_Parser { ... };` + `uwb_parser_feed(&p, c)` |
+| `class DistanceFilter { ... };` | `struct DistanceFilter { ... };` + `dist_filter_apply(&df, raw, n)` |
+| `class PositionFilter { ... };` | `struct PositionFilter { ... };` + `pos_filter_apply(&pf, &x, &y, &z)` |
+| `class UWBSolver { ... };` | `struct UWBSolver { ... };` + `uwb_solver_solve(&s, ...)` |
+| 构造函数 | `*_init()` 函数 |
+| `private:` 方法 | `static` 函数 |
+| `new` / `delete` | 栈分配全局变量 |
+
+包含 4 个模块：
+1. `median_float()` — 冒泡排序中位数 (n ≤ 8)，DistanceFilter / PositionFilter 共用
+2. `UWB_Parser` — `$DIST,M1,S<id>,<m>` 协议解析，逐字符 feed，8 锚点缓存
+3. `DistanceFilter` — 8 帧滑动窗口中位数 + 跳变限幅 (0.8m)
+4. `PositionFilter` — 解算后 x,y,z 8 帧中值平滑
+5. `UWBSolver` — 加权最小二乘三边测量 (solve3x3 Cramer → solve_2d/solve_3d)，含速度有限差分
+
+### `uwb_nmea.h` — NMEA 生成器 C 改写 (160 行)
+
+- `class NMEA_Generator` → `struct NMEA_Generator` + 独立函数
+- **HAL-free 设计**：时间戳 `now_sec` 由调用者传入（main.c 用 `HAL_GetTick()/1000`），头文件不依赖 HAL
+- `local_to_gps()` — UWB 局部坐标 → GPS E7（flat-earth projection, cos(lat) 修正）
+- `deg_to_nmea_lat/lon()` — 十进制度 → NMEA `ddmm.mmmm` 格式
+- `nmea_gen_generate()` — 7 步管线生成 `$GPGGA` + `$GPRMC`
+- `date_str[8]` → `date_str[16]` — 修复 `-Wformat-truncation` 警告
+
+### `main.c` — HAL 主循环 (CubeMX USER CODE 填充)
+
+**串口分配**：
+
+| USART | 引脚 | 连接 | 波特率 | 用途 |
+|-------|------|------|--------|------|
+| USART1 | PA9 TX | USB-TTL → PC | 115200 | printf 调试 |
+| USART2 | PA3 RX | JZM01 基座 TX | 19200 | `$DIST` 接收 (IT) |
+| USART3 | PB10 TX | 飞控 GPS RX | 57600 | NMEA 输出 (DMA) |
+
+**关键实现**：
+- `_write()` 重定向 printf → USART1
+- USART2 中断逐字符接收 → `HAL_UART_RxCpltCallback` → `uwb_parser_feed()`
+- USART3 DMA 发送 NMEA，带 50ms 超时保护
+- `rx2_len` 加 `volatile`（ISR 写入，主循环读取）
+- 所有 printf 使用 `%d` 整数格式（无 `%f`，省 ~12KB flash）
+
+### `stm32_uwb.ioc` — CubeMX 项目配置
+
+- MCU: STM32F103C8Tx, 72MHz HSE+PLL
+- USART1 115200 / USART2 19200 / USART3 57600
+- USART2_RX → DMA1 Channel6 循环模式，USART2 NVIC 中断使能
+- USART3_TX → DMA1 Channel2 普通模式
+- 生成完整 HAL 项目骨架（CMSIS, HAL Driver, 启动文件, 链接脚本）
+
+### 物理接线 (6 根)
+
+```
+JZM01 TX  → PA3    |  STM32F103C8T6
+JZM01 GND → GND    |  Blue Pill (~¥12)
+飞控 RX   ← PB10   |  5V ← 飞控 BEC
+飞控 GND  → GND    |
+USB-TTL   ← PA9    |  (调试用，非必须)
+USB-TTL GND → GND  |
+```
+
+### 设计文档
+
+- `docs/superpowers/specs/2026-07-06-stm32-uwb-design.md` — 完整设计规格
+- `docs/superpowers/plans/2026-07-06-stm32-uwb-plan.md` — 实现计划 (6 tasks)
+- `stm32_uwb/` — 4 源文件 (~860 行纯 C) + CubeMX 项目
+
 ### 代码组织
 
 - 创建 `main/uwb_system/` 目录，整合所有 UWB 系统相关代码：

@@ -248,6 +248,22 @@ router = OutputRouter(cfg)
 router.output_position(x, y, z, vx, vy, vz)
 ```
 
+## 嵌入式部署 (STM32)
+
+本模块另有 **STM32F103C8T6 纯 C 移植版**，将定位解算直接跑在单片机上，取消机载计算机：
+
+```
+JZM01 TX → STM32 PA3 → 双中值滤波 + 三边求解 → NMEA → 飞控 GPS 口
+```
+
+- **成本**：¥12（Blue Pill 开发板）
+- **重量**：~5g
+- **语言**：纯 C（STM32CubeIDE + HAL）
+- **代码**：`stm32_uwb/`（项目根目录下）
+- **差异**：中值滤波替代 EKF、硬编码坐标替代交互标定、无 UDP 输出
+
+详见项目 [README](../README.md#stm32f103c8t6-嵌入式部署取消机载计算机) 和 [DEVLOG](../DEVLOG.md#2026-07-06)。
+
 ## 故障排查
 
 | 问题 | 原因 | 解决 |

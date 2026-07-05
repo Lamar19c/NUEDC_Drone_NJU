@@ -10,11 +10,19 @@ main/
 ├── gcs.html                   # 浏览器端地面站前端
 ├── drone_mission_rectangle.py # MAVLink 矩形航线任务示例脚本
 ├── UWB/
-│   ├── uwb.py                 # UWB 室内定位（零配置，自动发现+一键标定）
+│   ├── uwb.py                 # Python UWB 室内定位（零配置，PC/Pi 运行）
 │   ├── uwb_config.json        # 可选覆盖配置（所有字段可省略）
+│   ├── uwb_arduino/           # Arduino C++ 移植版（Nano 33 BLE / ESP32）
 │   └── README.md              # UWB 模块详细文档
+├── stm32_uwb/                 # STM32F103C8T6 纯 C 移植（CubeMX + HAL）
+│   ├── Core/Src/main.c        # HAL 主循环
+│   ├── Core/Inc/uwb_config.h  # 配置参数
+│   ├── Core/Inc/uwb_solver.h  # 解析 + 双中值滤波 + 三边求解
+│   ├── Core/Inc/uwb_nmea.h    # NMEA 生成器
+│   └── stm32_uwb.ioc          # CubeMX 项目
 ├── docs/
-│   └── hardware-deployment.md # 树莓派部署方案
+│   ├── hardware-deployment.md # 树莓派部署方案
+│   └── superpowers/           # 设计规格 + 实现计划
 ├── DEVLOG.md                  # 开发日志
 ├── README.md                  # 本文件
 └── CLAUDE.md                  # Claude Code 项目指引
@@ -154,6 +162,65 @@ python gcs_bridge.py
 ## 部署到树莓派
 
 参见[硬件部署方案](docs/hardware-deployment.md)。
+
+---
+
+## STM32F103C8T6 嵌入式部署（取消机载计算机）
+
+将 UWB 定位解算从 Python 下沉到 ¥12 单片机，直接输出 NMEA 伪 GPS 到飞控。
+
+### 硬件（6 根线）
+
+```
+JZM01 基座 TX → STM32 PA3  (USART2 RX)    ← $DIST 测距数据
+JZM01 基座 GND → STM32 GND
+STM32 PB10     → 飞控 GPS RX              ← NMEA 伪 GPS 输出
+飞控 GND        → STM32 GND
+USB-TTL        ← STM32 PA9  (USART1 TX)   ← 调试 printf (可选)
+飞控 BEC 5V    → STM32 5V                  ← 供电
+```
+
+### 配置（仅首次）
+
+编辑 `stm32_uwb/Core/Inc/uwb_config.h`：
+
+```c
+// 锚点坐标 — 卷尺量场地四角
+static const float ANCHOR_POSITIONS[4][3] = {
+    {0.0f, 0.0f, 1.8f},   // S1
+    {6.0f, 0.0f, 1.8f},   // S2
+    {0.0f, 8.0f, 1.8f},   // S3
+    {6.0f, 8.0f, 1.8f},   // S4
+};
+
+// GPS 参考原点 — Google 地图查场地中心
+#define GPS_ORIGIN_LAT   321148408
+#define GPS_ORIGIN_LON   1189590664
+#define GPS_ORIGIN_ALT   1200    // 厘米
+```
+
+改完 → 编译 → ST-Link 烧录 → 上电即用（无需标定、无需串口助手、零交互）。
+
+### 飞控参数
+
+| 参数 | 值 |
+|------|-----|
+| `SERIALx_PROTOCOL` | 5 |
+| `SERIALx_BAUD` | 57 (57600) |
+| `GPS_TYPE` | 1 (AUTO) |
+
+### 与 Python 版对比
+
+| | Python (uwb.py) | STM32 (stm32_uwb/) |
+|---|---|---|
+| 运行平台 | Pi / 旭日X3 / PC | STM32F103C8T6 |
+| 成本 | ~¥200+ | ~¥12 |
+| 重量 | ~50g+ | ~5g |
+| 滤波 | 6 状态 EKF | 双中值滤波 |
+| 标定 | 交互式 3 模式菜单 | 硬编码坐标 |
+| 输出 | 终端 + UDP + NMEA | printf 调试 + NMEA |
+| 语言 | Python | 纯 C |
+| 框架 | pyserial + numpy | STM32CubeIDE + HAL |
 
 ## 技术栈
 

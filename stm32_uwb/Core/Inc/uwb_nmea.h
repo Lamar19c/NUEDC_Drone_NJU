@@ -133,7 +133,7 @@ static void nmea_gen_generate(struct NMEA_Generator *n,
     int day = (__DATE__[4] == ' ' ? 0 : (__DATE__[4] - '0') * 10) + (__DATE__[5] - '0');
     int month = month_num(__DATE__);
     int year = (__DATE__[9] - '0') * 10 + (__DATE__[10] - '0');
-    char date_str[8];
+    char date_str[16];
     snprintf(date_str, sizeof(date_str), "%02d%02d%02d", day, month, year);
 
     /* Step 5: Speed + course */

@@ -59,7 +59,7 @@ static const float ANCHOR_POSITIONS[ANCHOR_COUNT][3] = {
 
 #define GPS_ORIGIN_LAT   321148408   /* 32.1148408° (E7) */
 #define GPS_ORIGIN_LON   1189590664  /* 118.9590664° (E7) */
-#define GPS_ORIGIN_ALT   1200        /* 120.0m (cm) */
+#define GPS_ORIGIN_ALT   1200        /* 12.0m (cm) */
 #define NMEA_RATE_HZ     5.0f
 
 /* ========================================================================

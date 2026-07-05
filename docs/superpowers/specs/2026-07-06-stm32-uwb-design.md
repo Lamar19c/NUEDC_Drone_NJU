@@ -22,7 +22,7 @@
 
 ```
 stm32_uwb/
-├── Core/Src/main.c              # HAL 初始化 + 主循环 (~150行)
+├── Core/Src/main.cpp            # HAL 初始化 + 主循环 (~150行)
 ├── Core/Inc/uwb_config.h        # 配置参数 — 锚点坐标、串口、滤波参数 (~80行)
 ├── Core/Inc/uwb_solver.h        # UWB_Parser + DistanceFilter + PositionFilter + UWBSolver (~400行)
 ├── Core/Inc/uwb_nmea.h          # NMEA_Generator — 坐标转换 + $GPGGA/$GPRMC 生成 (~150行)
@@ -205,10 +205,10 @@ const float ANCHOR_POSITIONS[ANCHOR_COUNT][3] = {
 
 | 文件 | 操作 | 改动量 |
 |------|------|--------|
-| `Core/Src/main.c` | 新建 | ~150 行 |
+| `Core/Src/main.cpp` | 新建 | ~150 行 |
 | `Core/Inc/uwb_config.h` | 从 `uwb_arduino/` 复制并改值 | ~5 行 |
 | `Core/Inc/uwb_solver.h` | 从 `uwb_arduino/` 复制，替换 `#include <Arduino.h>` | ~5 行 |
 | `Core/Inc/uwb_nmea.h` | 从 `uwb_arduino/` 复制，替换 `#include <Arduino.h>` | ~5 行 |
 | `stm32_uwb.ioc` | CubeMX 新建 | 图形化配置 |
 
-总新增代码量约 150 行 (`main.c`)，其余 650 行算法代码直接从 Arduino 版复用。
+总新增代码量约 150 行 (`main.cpp`)，其余 650 行算法代码直接从 Arduino 版复用。

@@ -10,3 +10,4 @@ __MACOSX/
 Thumbs.db
 .claude/settings.local.json
 .superpowers/
+UWB/uwb_arduino/

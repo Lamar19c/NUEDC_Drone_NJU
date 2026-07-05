@@ -11,3 +11,4 @@ Thumbs.db
 .claude/settings.local.json
 .superpowers/
 UWB/uwb_arduino/
+stm32_uwb/Debug/

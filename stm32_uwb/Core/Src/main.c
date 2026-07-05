@@ -28,8 +28,8 @@ int _write(int fd, char *ptr, int len) {
 /* ---- USART2 DMA 环形接收 ---- */
 #define RX2_BUF_SIZE  256
 static uint8_t  rx2_buf[RX2_BUF_SIZE];
-static uint16_t rx2_len = 0;
-static volatile uint8_t rx2_ready = 0;
+static volatile uint16_t rx2_len = 0;
+static volatile uint8_t  rx2_ready = 0;
 
 /* ---- 全局对象 (栈分配, 无堆) ---- */
 static struct UWB_Parser      parser;
@@ -155,8 +155,11 @@ int main(void) {
             const char *ggpa = nmea_gen_ggpa(&nmea);
             const char *rmc  = nmea_gen_rmc(&nmea);
             HAL_UART_Transmit_DMA(&huart3, (uint8_t *)ggpa, (uint16_t)strlen(ggpa));
-            while (HAL_UART_GetState(&huart3) != HAL_UART_STATE_READY) {
-                /* wait for DMA to finish before sending second sentence */
+            {
+                uint32_t dma_timeout = HAL_GetTick() + 50;
+                while (HAL_UART_GetState(&huart3) != HAL_UART_STATE_READY) {
+                    if (HAL_GetTick() > dma_timeout) break;  /* DMA hung, skip */
+                }
             }
             HAL_UART_Transmit_DMA(&huart3, (uint8_t *)rmc, (uint16_t)strlen(rmc));
 

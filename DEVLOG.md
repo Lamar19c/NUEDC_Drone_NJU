@@ -344,3 +344,68 @@
   - `UWBSolver.__init__()` 默认参数：`measurement_noise: float = 0.01`
   - EKF 初始协方差 `self.P`：`np.eye(6) * 0.01`（与原噪声水平保持一致）
   - 文档字符串：`σ_meas ≈ 0.32 m` → `σ_meas ≈ 0.1 m`
+
+## 2026-06-06
+
+### UWB 系统重新设计 — Anchor↔Anchor 自标定方案
+
+- **需求分析**：当前 JZM01 UWB 方案需要人工标定锚点位置（三点法/已知点位法），无法自动部署
+- **关键洞察**：如果 Anchor 之间可以互相测距（A2A TWR），可以通过 MDS（多维缩放）从距离矩阵自动求解锚点坐标，实现上电即自动标定
+- **Download 目录发现**：下载的 `UWB_TDOA_STATION_V1_1`（TREK Station）代码已完整实现了：
+  - Anchor↔Anchor TWR (`ANCTOANCTWR=1`)
+  - TDMA superframe/slot 调度
+  - UWB 帧内嵌 ToF 自动转发至 Gateway (S1)
+  - 4 锚点角色管理 (A0 Gateway / A1 / A2 / A3 Listener)
+- **TREK Tag 分析**：`UWB_TDOA_TAG_V1_1` 是基于 FreeRTOS 的 Blink 发射器，协议与 TREK Station 不兼容（帧控制字 0xC5 vs 0x41，功能码不同），仅作参考
+
+### 硬件方案确定
+
+- **放弃 ESP32-C3 方案**：TREK 代码基于 STM32F1 HAL，选 ESP32 需要重写整个 HAL 层
+- **放弃额外无线模块**（HC-42 BLE、NRF24L01）：经代码审查发现 TREK 协议通过 UWB Response/Final 帧自动转发锚间 ToF 数据，Gateway 收齐全部距离，无需外部通信链路
+- **最终方案**：STM32F103 + DWM1000 模组，Station 和 Tag 使用同一 TREK 代码库
+
+### PCB 设计
+
+| | Station V1 (基站) | Tag V1 (机载) |
+|---|---|---|
+| MCU | STM32F103RCT6 (256KB) | STM32F103C8T6 (64KB) |
+| UWB | DWM1000 模组 | DWM1000 模组 |
+| 供电 | 18650 + TP4056 + USB-C | 5V BEC → AMS1117 |
+| USB-UART | CP2102N | 排针 (接 Pi/旭日) |
+| LED | RGB LED (状态指示) | 单色 LED |
+| DIP 开关 | 2位 (S1~S4 身份选择) | 无 (固定 TAG) |
+| 尺寸 | 55×55mm 4层 | 30×40mm 2层 |
+| BOM 成本 | ~¥77 | ~¥53 |
+
+- **设计文档**：`main/uwb_system/pcb/station_v1.md` 和 `tag_v1.md`
+
+### 固件架构 — TREK 代码 90% 复用
+
+- **Station 固件**：Download 目录 TREK Station 代码的 `instance.c`、`instance_common.c`、`deca_device.c`、`port.c` 完全不动
+- **仅需修改 `main.c`**：删除 LCD/W5500，新增 3 个模块调用
+- **新增模块**（`main/uwb_system/modules/`）：
+
+| 模块 | 功能 |
+|------|------|
+| `dist_aggregator.c/h` | 从 TREK `TOF_REPORT_A2A` 回调读取距离 → 构建 4×4 矩阵 |
+| `auto_calib.c/h` | Jacobi 特征分解 → MDS 求解锚点 3D 坐标 → UART 输出 `$CALIB` |
+| `led_status.c/h` | RGB LED 部署状态: 白闪→蓝闪→蓝亮→绿亮 |
+
+- **自动部署流程**：上电 → TDMA 锚间测距(~3s) → 收齐 6 条距离 → MDS 求解(~1s) → 绿亮就绪
+- **UART 输出协议**：原有 `mc`/`mr`/`ma` (TREK) + 新增 `$CALIB`/`$READY` (自标定)
+
+### 弃用文件清理
+
+- 删除 `__pycache__/` (残留缓存)
+- 删除 `JZM01/anchor_twr_auto_v2.c` (JZM01 方案已放弃)
+- 删除 `docs/hardware/port_esp32.c` (ESP32 方案已放弃)
+- 删除 `docs/hardware/anchor_mesh.c/h` (HC-42 BLE 方案已放弃)
+- 删除 `docs/hardware/jzm01_compat.c` (JZM01 兼容层不再需要)
+
+### 代码组织
+
+- 创建 `main/uwb_system/` 目录，整合所有 UWB 系统相关代码：
+  - `station/` — Station 固件核心代码（从 Download 复制）
+  - `tag/` — Tag 参考代码（从 Download 复制）
+  - `modules/` — 新增功能模块
+  - `pcb/` — PCB 设计文档

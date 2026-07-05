@@ -23,21 +23,43 @@ from pymavlink import mavutil
 # =========================================================
 # 1. 连接飞控
 # =========================================================
-def connect_vehicle(connection_string: str, baud: int = 57600):
+def connect_vehicle(connection_string: str, baud: int = None):
     """
     建立与飞控的 MAVLink 连接，并等待第一个心跳包。
 
-    常见的连接字符串：
-      USB 直连 (Linux):     '/dev/ttyACM0'   波特率通常 115200
-      数传电台 (Linux):     '/dev/ttyUSB0'   波特率通常 57600
-      USB 直连 (Windows):   'COM3'           波特率通常 115200
-      SITL 仿真:            'udp:127.0.0.1:14550'
+    常见连接字符串：
+      USB 直连 (Linux):       '/dev/ttyACM0'           波特率通常 115200
+      数传电台 (Linux):       '/dev/ttyUSB0'           波特率通常 57600
+      USB 直连 (Windows):     'COM3'                   波特率通常 115200
+      WiFi 数传 (UDP):        'udp:192.168.4.1:14550'  端口号必须带在 URL 中
+      SITL 仿真:              'udp:127.0.0.1:14550'
     """
-    print(f"[连接] 正在连接 {connection_string} @ {baud} ...")
-    master = mavutil.mavlink_connection(connection_string, baud=baud)
+    is_network = connection_string.startswith(('udp:', 'tcp:', 'udpin:', 'tcpin:',
+                                                'udpout:', 'tcpout:', 'udpbcast:'))
 
-    # 心跳是 MAVLink 的"握手包"，飞控每秒会广播一次
-    master.wait_heartbeat()
+    if is_network:
+        print(f"[连接] 正在连接 {connection_string} ...")
+        master = mavutil.mavlink_connection(connection_string)
+    else:
+        if baud is None:
+            baud = 115200
+        print(f"[连接] 正在连接 {connection_string} @ {baud} baud ...")
+        master = mavutil.mavlink_connection(connection_string, baud=baud)
+
+    print("[连接] 等待心跳...", end=" ", flush=True)
+    try:
+        master.wait_heartbeat(timeout=10)
+    except Exception:
+        print("\n[连接] ✗ 超时 (10s) — 未收到飞控心跳")
+        if is_network:
+            print(f"  请检查: 是否已连接飞控 WiFi? IP {connection_string} 正确?")
+            print(f"          飞控 SERIALx_PROTOCOL 是否设为 1 (MAVLink)?")
+        else:
+            print(f"  请检查: 串口 {connection_string} 是否存在? 波特率 {baud} 是否匹配?")
+            print(f"          飞控是否已上电?")
+        raise ConnectionError(f"无法连接到 {connection_string}")
+
+    print("✓")
     print(f"[连接] 收到心跳: system={master.target_system}, "
           f"component={master.target_component}")
     return master
@@ -220,7 +242,7 @@ def hover(seconds: float):
 # =========================================================
 # 6. 主任务流程
 # =========================================================
-def run_mission(connection_string: str, baud: int = 115200):
+def run_mission(connection_string: str, baud: int = None):
     # ----- 飞行参数 (单位: 米) -----
     ALTITUDE       = 3.0       # 起飞高度
     FORWARD_DIST   = 5.0       # 第一段往前飞的距离
@@ -286,14 +308,16 @@ def run_mission(connection_string: str, baud: int = 115200):
 # 入口
 # =========================================================
 if __name__ == '__main__':
-    # ===== 在这里改成你自己的连接方式 =====
-    # 例 1: USB 直连飞控  (推荐入门用)
-    #CONN = '/dev/ttyACM0';  BAUD = 115200
-    # 例 2: 数传电台: WIFI数传
-    #CONN = 'udp:192.168.4.2'; BAUD = 57600
-    # 例 3: SITL 仿真 (强烈推荐先用这个调通)
-    CONN = 'udp:127.0.0.1:14550'; BAUD = 115200
-    # 例 4: Windows
-    #CONN = 'COM9'; BAUD = 115200
+    # ===== 选择连接方式 (取消注释你要用的那一行) =====
+    # WiFi 数传 (UDP) — 端口号必须带在 URL 中
+    CONN = 'udp:192.168.4.2:14550'
+    # 数传电台 (串口)
+    # CONN = '/dev/ttyUSB0'; BAUD = 57600
+    # USB 直连飞控
+    # CONN = '/dev/ttyACM0'; BAUD = 115200
+    # SITL 仿真
+    # CONN = 'udp:127.0.0.1:14550'
+    # Windows
+    # CONN = 'COM9'; BAUD = 115200
 
-    run_mission(CONN, BAUD)
+    run_mission(CONN)

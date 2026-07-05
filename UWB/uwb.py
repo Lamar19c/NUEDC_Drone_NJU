@@ -24,12 +24,18 @@ import os
 import socket
 import sys
 import time
+import statistics
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 import serial
 import serial.tools.list_ports
+
+# 滑动窗口缓存（模块级，每个锚点独立缓存）
+DIST_WINDOW: deque = deque(maxlen=8)
+MAX_DIST_JUMP = 0.8  # 单帧测距最大允许跳变(米)，超过判定为野值
 
 
 # ============================================================================
@@ -213,11 +219,12 @@ def auto_discover_uwb(verbose: bool = True) -> Optional[tuple]:
 
 def _read_distances_avg(reader: SerialReader, n_samples: int = 5,
                         timeout: float = 2.0) -> Optional[list]:
-    """读取多组距离取均值"""
     all_dists = []
     for _ in range(n_samples):
         d = reader.read_distances(timeout=timeout)
         if d:
+            # 新增：原始测距先滤波
+            d = filter_distance(d)
             all_dists.append(d)
         time.sleep(0.1)
     if not all_dists:
@@ -462,85 +469,75 @@ def _parse_points_arg(arg: str) -> list:
 
 
 class UWBEKF:
-    """扩展卡尔曼滤波，状态 [x, y, z, vx, vy, vz]
-
-    Parameters
-    ----------
-    measurement_noise : float
-        测量噪声方差 (m²)，默认 0.01 → σ_meas ≈ 0.1 m
-    accel_noise : float
-        加速度过程噪声功率谱密度 (m²/s³)，控制速度平滑强度。
-        值越小→速度越平滑但响应越慢。默认 0.5（适用于步行~慢速无人机）。
+    """自适应扩展卡尔曼滤波（适配无人机悬停/机动）
+    静止：强滤波、抑制抖动；机动：降低滤波强度、提升响应速度
     """
-
-    def __init__(self, measurement_noise: float = 0.01, accel_noise: float = 0.5):
+    def __init__(self, base_meas_noise: float = 0.01, base_accel_noise: float = 0.5):
         self.x = np.zeros((6, 1))
         self.P = np.eye(6) * 0.01
-        self.R = np.eye(3) * measurement_noise
-        self._accel_noise = accel_noise
+        self.base_R = base_meas_noise    # 基础测量噪声
+        self.base_q = base_accel_noise   # 基础加速度噪声
         self._initialized = False
 
+    def _calc_adaptive_noise(self):
+        """根据当前速度自适应调整噪声矩阵"""
+        v = np.linalg.norm(self.x[3:6])  # 合速度
+        # 速度越大，测量噪声放宽（信任测距）、过程噪声加大（允许状态变化）
+        scale = 1.0 + min(v * 2.0, 3.0)
+        R = np.eye(3) * self.base_R * scale
+        q = self.base_q * scale
+        return R, q
+
     def predict(self, dt: float) -> None:
-        """匀速模型状态预测，dt 为实际时间步长（秒）"""
-        # ── 状态转移 ──
         F = np.eye(6)
         F[0, 3] = dt
         F[1, 4] = dt
         F[2, 5] = dt
         self.x = F @ self.x
 
-        # ── 过程噪声 Q：连续白噪声加速度模型 (CWNA) ──
-        #  Q_block = [[dt³/3, dt²/2],
-        #             [dt²/2, dt   ]] * q     (per axis)
-        q = self._accel_noise
+        # 自适应过程噪声
+        _, q = self._calc_adaptive_noise()
         dt2 = dt * dt
         dt3_3 = dt2 * dt / 3.0
         dt2_2 = dt2 / 2.0
-
         Q = np.zeros((6, 6))
-        for i in range(3):  # x, y, z axes
+        for i in range(3):
             Q[i, i] = dt3_3 * q
             Q[i, i + 3] = dt2_2 * q
             Q[i + 3, i] = dt2_2 * q
             Q[i + 3, i + 3] = dt * q
-
         self.P = F @ self.P @ F.T + Q
 
     def update(self, z_meas: np.ndarray) -> None:
-        H = np.array([[1, 0, 0, 0, 0, 0],
-                       [0, 1, 0, 0, 0, 0],
-                       [0, 0, 1, 0, 0, 0]])
-
+        H = np.array([[1,0,0,0,0,0],[0,1,0,0,0,0],[0,0,1,0,0,0]])
         if not self._initialized:
-            # 首帧直接设位置，避免零初态导致的虚假速度尖峰
-            self.x[0, 0] = z_meas[0]
-            self.x[1, 0] = z_meas[1]
-            self.x[2, 0] = z_meas[2]
+            self.x[0,0] = z_meas[0]
+            self.x[1,0] = z_meas[1]
+            self.x[2,0] = z_meas[2]
             self._initialized = True
             return
-
-        y = z_meas.reshape(3, 1) - H @ self.x
-        S = H @ self.P @ H.T + self.R
+        
+        R, _ = self._calc_adaptive_noise()
+        y = z_meas.reshape(3,1) - H @ self.x
+        S = H @ self.P @ H.T + R
         K = self.P @ H.T @ np.linalg.inv(S)
         self.x = self.x + K @ y
-        # Joseph 形式 + 对称化防止浮点累积
+
         I_KH = np.eye(6) - K @ H
-        self.P = I_KH @ self.P @ I_KH.T + K @ self.R @ K.T
+        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
 
     def update_2d(self, z_meas: np.ndarray, fixed_z: float) -> None:
-        """2D 更新：仅更新 x, y，z 固定为 fixed_z，vz 清零"""
-        H = np.array([[1, 0, 0, 0, 0, 0],
-                       [0, 1, 0, 0, 0, 0]])
-
+        H = np.array([[1,0,0,0,0,0],[0,1,0,0,0,0]])
         if not self._initialized:
-            self.x[0, 0] = z_meas[0]
-            self.x[1, 0] = z_meas[1]
-            self.x[2, 0] = fixed_z
+            self.x[0,0] = z_meas[0]
+            self.x[1,0] = z_meas[1]
+            self.x[2,0] = fixed_z
             self._initialized = True
             return
-
-        y_vec = z_meas.reshape(2, 1) - H @ self.x
-        R_2d = self.R[:2, :2]
+        
+        R, _ = self._calc_adaptive_noise()
+        R_2d = R[:2, :2]
+        y_vec = z_meas.reshape(2,1) - H @ self.x
         S = H @ self.P @ H.T + R_2d
         K = self.P @ H.T @ np.linalg.inv(S)
         self.x = self.x + K @ y_vec
@@ -551,11 +548,10 @@ class UWBEKF:
 
     @property
     def position(self) -> tuple:
-        return (self.x[0, 0], self.x[1, 0], self.x[2, 0])
-
+        return (self.x[0,0], self.x[1,0], self.x[2,0])
     @property
     def velocity(self) -> tuple:
-        return (self.x[3, 0], self.x[4, 0], self.x[5, 0])
+        return (self.x[3,0], self.x[4,0], self.x[5,0])
 
 
 class UWBSolver:
@@ -597,22 +593,30 @@ class UWBSolver:
         p0 = anchors[0]
         d0 = d[0]
         p0_norm_sq = np.dot(p0, p0)
-
+    
         A = np.zeros((len(anchors) - 1, 3))
         b = np.zeros(len(anchors) - 1)
+    # 加权系数：测距越小(距离越近)权重越高，抗干扰越强
+        weights = 1.0 / (d[1:] + 0.1)  
 
         for i in range(1, len(anchors)):
             pi = anchors[i]
-            A[i - 1] = 2.0 * (pi - p0)
-            b[i - 1] = (d0 * d0 - d[i] * d[i]
-                        - p0_norm_sq + np.dot(pi, pi))
+            A[i - 1] = 2.0 * (pi - p0) * weights[i-1]
+            b[i - 1] = (d0**2 - d[i]**2 - p0_norm_sq + np.dot(pi, pi)) * weights[i-1]
 
-        result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    # 加权最小二乘求解
+        result, residuals, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    
+    # 残差过大判定解算失效（多径严重时丢弃当前解）
+        if residuals.size > 0 and residuals[0] > 2.0:
+            return None
 
         z_meas = np.array(result)
+    # 坐标范围约束（室内场地限制，防止解算飞出场地）
+        z_meas = np.clip(z_meas, -10, 10)
+
         self.ekf.predict(dt)
         self.ekf.update(z_meas)
-
         x, y, z = self.ekf.position
         vx, vy, vz = self.ekf.velocity
         return (x, y, z, vx, vy, vz)
@@ -624,25 +628,26 @@ class UWBSolver:
         d0 = d[0]
         p0_norm_sq = np.dot(p0, p0)
 
-        # _solve_2d is only called when exactly 3 anchors respond
-        # (4+ anchors → _solve_3d for full 3D solution)
         A = np.zeros((2, 2))
         b = np.zeros(2)
+        weights = 1.0 / (d[1:] + 0.1)
 
         for i in range(1, 3):
             pi = anchors[i]
-            rhs = (d0 * d0 - d[i] * d[i]
-                   - p0_norm_sq + np.dot(pi, pi)
-                   - 2.0 * (pi[2] - p0[2]) * fixed_z)
-            A[i - 1] = 2.0 * (pi[:2] - p0[:2])
-            b[i - 1] = rhs
+            rhs = (d0**2 - d[i]**2 - p0_norm_sq + np.dot(pi, pi)
+               - 2.0 * (pi[2] - p0[2]) * fixed_z)
+            A[i - 1] = 2.0 * (pi[:2] - p0[:2]) * weights[i-1]
+            b[i - 1] = rhs * weights[i-1]
 
-        result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        result, residuals, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        if residuals.size > 0 and residuals[0] > 1.5:
+            return None
 
         z_meas = np.array([result[0], result[1]])
+        z_meas = np.clip(z_meas, -10, 10)
+
         self.ekf.predict(dt)
         self.ekf.update_2d(z_meas, fixed_z)
-
         x, y, z = self.ekf.position
         vx, vy, vz = self.ekf.velocity
         return (x, y, z, vx, vy, vz)
@@ -744,12 +749,21 @@ class SerialReader:
 
 def local_to_gps(x: float, y: float, z: float,
                  origin_lat: int, origin_lon: int, origin_alt: int) -> tuple:
-    lat_rad = math.radians(origin_lat / 1e7)
-    meters_per_deg_lat = 111320.0
-    meters_per_deg_lon = 111320.0 * math.cos(lat_rad)
+    lat_deg = origin_lat / 1e7
+    lon_deg = origin_lon / 1e7
+    lat_rad = math.radians(lat_deg)
+    
+    # 室内高精度米/度换算系数
+    m_per_deg_lat = 111319.9
+    m_per_deg_lon = 111319.9 * math.cos(lat_rad)
 
-    lat = origin_lat + int(y * 1e7 / meters_per_deg_lat)
-    lon = origin_lon + int(x * 1e7 / meters_per_deg_lon)
+    # 限幅：防止室内漂移过大
+    y = np.clip(y, -20, 20)
+    x = np.clip(x, -20, 20)
+    z = np.clip(z, 0, 10)
+
+    lat = origin_lat + int(y * 1e7 / m_per_deg_lat)
+    lon = origin_lon + int(x * 1e7 / m_per_deg_lon)
     alt = origin_alt + int(z * 1000)
     return (lat, lon, alt)
 
@@ -988,6 +1002,44 @@ class OutputRouter:
 # ============================================================================
 
 
+def filter_distance(raw_dists: list) -> list:
+    """
+    测距值滤波：滑动窗口+中位数滤波+跳变限幅，抑制UWB多径/射频噪声
+    raw_dists: [S1,S2,S3,S4] 原始测距列表(含None)
+    return: 滤波后测距列表
+    """
+    # 过滤有效数据，剔除单帧缺失值
+    valid_dists = [d for d in raw_dists if d is not None and d > 0 and d < 50]
+    if not valid_dists:
+        return raw_dists
+
+    # 入滑动窗口
+    DIST_WINDOW.append(valid_dists)
+    if len(DIST_WINDOW) < 3:
+        return raw_dists
+
+    # 逐锚点做中位数滤波（抗野值远优于均值）
+    filtered = []
+    anchor_cnt = len(raw_dists)
+    for idx in range(anchor_cnt):
+        # 提取该锚点历史N帧数据
+        hist = []
+        for frame in DIST_WINDOW:
+            if idx < len(frame) and frame[idx] is not None:
+                hist.append(frame[idx])
+        if len(hist) < 2:
+            filtered.append(raw_dists[idx])
+            continue
+        # 中位数降噪
+        med_val = statistics.median(hist)
+        # 跳变限幅：防止单帧突变
+        if raw_dists[idx] is not None and abs(raw_dists[idx] - med_val) > MAX_DIST_JUMP:
+            filtered.append(med_val)
+        else:
+            filtered.append(raw_dists[idx])
+    return filtered
+
+
 def main():
     default_config = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "uwb_config.json")
@@ -1130,6 +1182,8 @@ def main():
             distances = reader.read_distances(timeout=2.0)
             if distances is None:
                 continue
+            # ========== 新增这一行：测距滤波 ==========
+            distances = filter_distance(distances)
 
             result = solver.solve(distances)
             if result is None:
@@ -1151,3 +1205,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

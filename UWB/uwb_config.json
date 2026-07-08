@@ -11,7 +11,9 @@
   "output": {
     "terminal": true,
     "udp_broadcast": {"enabled": false, "host": "192.168.4.2", "port": 14550},
-    "gps_emulation": {"enabled": true, "serial_port": "COM10", "serial_baud": 57600}
+    "gps_emulation": {"enabled": true, "serial_port": "COM10", "serial_baud": 57600,
+      "nmea_hdop": 1.5, "nmea_satellites": 10
+    }
   },
   "ekf_origin_lat": 321148408,
   "ekf_origin_lon": 1189590664,

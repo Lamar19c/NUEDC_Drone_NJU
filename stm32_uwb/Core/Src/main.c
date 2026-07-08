@@ -26,6 +26,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "uwb_config.h"
 #include "uwb_solver.h"
 #include "uwb_nmea.h"
@@ -63,6 +64,7 @@ static struct UWB_Parser      parser;
 static struct DistanceFilter  dist_filt;
 static struct UWBSolver       solver;
 static struct NMEA_Generator  nmea;
+static struct VelocityFilter  vel_filt;
 
 /* ---- position cache ---- */
 static float gx = 0.0f, gy = 0.0f, gz = 1.0f;
@@ -74,10 +76,74 @@ static uint32_t nmea_count = 0;
 static uint32_t last_nmea_time = 0;
 static uint32_t loop_count = 0;
 
+/* ---- non-blocking loop ---- */
+static uint32_t last_loop_time = 0;
+
+/* ---- runtime stats ---- */
+static uint32_t stat_parse_ok = 0, stat_parse_err = 0;
+static uint32_t stat_solve_ok = 0, stat_solve_fail = 0;
+static uint32_t stat_nmea_frames = 0;
+static uint32_t last_stat_time = 0;
+
+/* ---- NMEA non-blocking DMA chain ---- */
+typedef enum {
+    NMEA_IDLE = 0,
+    NMEA_SENDING_GGPA,
+    NMEA_SENDING_RMC,
+    NMEA_SENDING_VTG
+} nmea_tx_state_t;
+
+static nmea_tx_state_t nmea_tx_state = NMEA_IDLE;
+static const char *nmea_tx_rmc_ptr  = NULL;  /* saved for chaining */
+static const char *nmea_tx_vtg_ptr  = NULL;
+
+/** Kick off NMEA DMA chain: GGA → RMC → VTG via TX complete callback. */
+static void nmea_start_dma_send(const char *ggpa, const char *rmc, const char *vtg) {
+    if (nmea_tx_state != NMEA_IDLE) return;  /* still sending previous batch */
+    nmea_tx_rmc_ptr = rmc;
+    nmea_tx_vtg_ptr = vtg;
+    nmea_tx_state   = NMEA_SENDING_GGPA;
+    HAL_UART_Transmit_DMA(&huart3, (uint8_t *)ggpa, (uint16_t)strlen(ggpa));
+}
+
 /* ---- USART2 receive complete callback ---- */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART2) {
-        uwb_parser_feed(&parser, (char)rx2_char);
+        uwb_parser_feed(&parser, (char)rx2_char, HAL_GetTick());
+        HAL_UART_Receive_IT(&huart2, &rx2_char, 1);
+    }
+}
+
+/* ---- USART3 TX complete callback (DMA chain: GGA → RMC → VTG) ---- */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART3) {
+        switch (nmea_tx_state) {
+        case NMEA_SENDING_GGPA:
+            nmea_tx_state = NMEA_SENDING_RMC;
+            HAL_UART_Transmit_DMA(&huart3, (uint8_t *)nmea_tx_rmc_ptr,
+                                  (uint16_t)strlen(nmea_tx_rmc_ptr));
+            break;
+        case NMEA_SENDING_RMC:
+            nmea_tx_state = NMEA_SENDING_VTG;
+            HAL_UART_Transmit_DMA(&huart3, (uint8_t *)nmea_tx_vtg_ptr,
+                                  (uint16_t)strlen(nmea_tx_vtg_ptr));
+            break;
+        case NMEA_SENDING_VTG:
+            nmea_tx_state = NMEA_IDLE;
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+/* ---- UART error recovery: prevent permanent receive stall ---- */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART2) {
+        /* clear error flags and restart receive */
+        __HAL_UART_CLEAR_OREFLAG(huart);
+        __HAL_UART_CLEAR_FEFLAG(huart);
+        __HAL_UART_CLEAR_NEFLAG(huart);
         HAL_UART_Receive_IT(&huart2, &rx2_char, 1);
     }
 }
@@ -130,9 +196,11 @@ int main(void)
   uwb_parser_init(&parser);
   dist_filter_init(&dist_filt);
   uwb_solver_init(&solver, ANCHOR_POSITIONS, ANCHOR_COUNT);
+  vel_filter_init(&vel_filt);
   nmea_gen_init(&nmea);
 
   HAL_UART_Receive_IT(&huart2, &rx2_char, 1);
+  last_stat_time = HAL_GetTick();
 
   printf("\r\n========================================\r\n");
   printf("  UWB Indoor 3D Localization - STM32F103C8T6\r\n");
@@ -165,19 +233,30 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    if (uwb_parser_valid_count(&parser) >= 3) {
+    /* ---- tick-based non-blocking scheduling ---- */
+    uint32_t now = HAL_GetTick();
+    if (now - last_loop_time < LOOP_INTERVAL_MS) continue;
+    last_loop_time = now;
+
+    /* ---- UWB solve ---- */
+    if (uwb_parser_valid_count(&parser, now) >= 3) {
         float distances[ANCHOR_COUNT];
-        uwb_parser_get_distances(&parser, distances, ANCHOR_COUNT);
-        uwb_parser_clear_distances(&parser);
+        int valid = uwb_parser_get_valid_distances(&parser, distances, ANCHOR_COUNT, now);
+        if (valid == 0) stat_parse_err++; else stat_parse_ok++;
+        /* 距离由超时机制自动失效，不再主动清空 */
 
         dist_filter_apply(&dist_filt, distances, ANCHOR_COUNT);
 
         float x, y, z, vx, vy, vz;
-        if (uwb_solver_solve(&solver, distances, HAL_GetTick(),
+        if (uwb_solver_solve(&solver, distances, now,
                              &x, &y, &z, &vx, &vy, &vz)) {
+            /* independent velocity low-pass filter (reduces phase lag) */
+            vel_filter_apply(&vel_filt, &vx, &vy, &vz);
+
             gx = x; gy = y; gz = z; gvx = vx; gvy = vy;
             has_pos = 1;
             loop_count++;
+            stat_solve_ok++;
 
             int32_t lat_e7, lon_e7, alt_mm;
             local_to_gps(x, y, z, GPS_ORIGIN_LAT, GPS_ORIGIN_LON, GPS_ORIGIN_ALT,
@@ -203,42 +282,52 @@ int main(void)
                    (long)(lat_e7 / 10000000),   labs(lat_e7 % 10000000),
                    (long)(lon_e7 / 10000000),   labs(lon_e7 % 10000000),
                    (long)(alt_mm / 1000),       labs(alt_mm % 1000));
+        } else {
+            stat_solve_fail++;
         }
     }
 
-    /* ---- NMEA output (5Hz) ---- */
-    uint32_t now = HAL_GetTick();
+    /* ---- NMEA output (5Hz, non-blocking DMA chain) ---- */
     if (now - last_nmea_time >= (uint32_t)(1000.0f / NMEA_RATE_HZ)) {
         last_nmea_time = now;
 
-        nmea_gen_generate(&nmea, gx, gy, gz, gvx, gvy,
-                          GPS_ORIGIN_LAT, GPS_ORIGIN_LON, GPS_ORIGIN_ALT,
-                          now / 1000UL);
+        /* DMA guard: don't overwrite buffers while DMA still active */
+        if (nmea_tx_state == NMEA_IDLE) {
+            nmea_gen_generate(&nmea, gx, gy, gz, gvx, gvy,
+                              GPS_ORIGIN_LAT, GPS_ORIGIN_LON, GPS_ORIGIN_ALT,
+                              now / 1000UL);
 
-        const char *ggpa = nmea_gen_ggpa(&nmea);
-        const char *rmc  = nmea_gen_rmc(&nmea);
-        HAL_UART_Transmit_DMA(&huart3, (uint8_t *)ggpa, (uint16_t)strlen(ggpa));
-        {
-            uint32_t dma_timeout = HAL_GetTick() + 50;
-            while (HAL_UART_GetState(&huart3) != HAL_UART_STATE_READY) {
-                if (HAL_GetTick() > dma_timeout) break;
+            const char *ggpa = nmea_gen_ggpa(&nmea);
+            const char *rmc  = nmea_gen_rmc(&nmea);
+            const char *vtg  = nmea_gen_vtg(&nmea);
+
+            /* non-blocking DMA chain: GGA→RMC→VTG via TX complete ISR */
+            nmea_start_dma_send(ggpa, rmc, vtg);
+
+            nmea_count++;
+            stat_nmea_frames++;
+            if (nmea_count == 1) {
+                printf("\r\n  NMEA first sentences sent:\r\n");
+                printf("    %s", ggpa);
+                printf("    %s", rmc);
+                printf("    %s\r\n\r\n", vtg);
             }
-        }
-        HAL_UART_Transmit_DMA(&huart3, (uint8_t *)rmc, (uint16_t)strlen(rmc));
-
-        nmea_count++;
-        if (nmea_count == 1) {
-            printf("\r\n  NMEA first sentence sent:\r\n");
-            printf("    %s", ggpa);
-            printf("    %s\r\n\r\n", rmc);
-        }
-        if (nmea_count % ((uint32_t)NMEA_RATE_HZ * 5) == 0) {
-            printf("  NMEA %lu -> USART3 %s\r\n",
-                   nmea_count, has_pos ? "[UWB]" : "[origin]");
+            if (nmea_count % ((uint32_t)NMEA_RATE_HZ * 5) == 0) {
+                printf("  NMEA %lu -> USART3 %s\r\n",
+                       nmea_count, has_pos ? "[UWB]" : "[origin]");
+            }
         }
     }
 
-    HAL_Delay(LOOP_INTERVAL_MS);
+    /* ---- runtime stats (every 5s) ---- */
+    if (now - last_stat_time >= 5000UL) {
+        last_stat_time = now;
+        printf("\r\n  === STATS (5s) ===\r\n");
+        printf("  parse: ok=%lu err=%lu | solve: ok=%lu fail=%lu\r\n",
+               stat_parse_ok, stat_parse_err, stat_solve_ok, stat_solve_fail);
+        printf("  nmea_sent: %lu | dma_state: %d\r\n\r\n",
+               stat_nmea_frames, (int)nmea_tx_state);
+    }
     /* USER CODE END 3 */
   }
   /* USER CODE END 3 */

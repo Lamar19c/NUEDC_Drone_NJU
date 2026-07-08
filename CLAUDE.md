@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
@@ -21,9 +21,26 @@ main/
 ├── drone_mission_rectangle.py     # MAVLink mission script example
 ├── UWB/
 │   ├── uwb.py                     # UWB localizer — all-in-one (zero-config, 3 calibration modes)
-│   └── uwb_config.json            # Optional config overrides (all fields auto-detected)
+│   ├── gps_fixed_emu.py           # Standalone GPS NMEA simulator — diagnostic tool, no UWB dependency
+│   ├── uwb_config.json            # Optional config overrides (all fields auto-detected)
+│   ├── uwb_arduino/               # Arduino C++ port (Nano 33 BLE / ESP32) — own CLAUDE.md
+│   │   ├── uwb_arduino.ino        # Arduino sketch entry point
+│   │   ├── uwb_config.h           # C++ config header (anchor coords, pins, baud rates)
+│   │   ├── uwb_solver.h           # Trilateration + DistanceFilter + PositionFilter + UWB_Parser
+│   │   └── uwb_nmea.h             # NMEA $GPGGA/$GPRMC generator (C++)
+│   └── README.md
+├── stm32_uwb/                     # STM32F103C8T6 pure-C port (CubeMX + HAL)
+│   ├── Core/Src/main.c            # HAL main loop — tick-based scheduling, DMA chain, stats
+│   ├── Core/Src/uwb_solver.c      # UWB parser + dual median filter + WLSQ trilateration (C)
+│   ├── Core/Src/uwb_nmea.c        # NMEA $GPGGA/$GPRMC/$GPVTG generator (C, integer %d only)
+│   ├── Core/Inc/uwb_config.h      # C config header (anchors, GPS origin, all tuning knobs)
+│   ├── Core/Inc/uwb_solver.h      # Solver + parser + 3 filter structs + declarations
+│   ├── Core/Inc/uwb_nmea.h        # NMEA_Generator struct + local_to_gps declaration
+│   └── stm32_uwb.ioc              # CubeMX project file
 ├── docs/
-│   └── hardware-deployment.md     # Pi-based deployment, wiring, systemd, UWB anchor layout
+│   ├── hardware-deployment.md     # Pi-based deployment, wiring, systemd, UWB anchor layout
+│   └── superpowers/               # Design specs + implementation plans
+├── fix_printf.py                  # One-off utility: repair broken printf format strings in STM32 main.c
 ├── README.md                      # Quick-start and feature overview
 ├── DEVLOG.md                      # Development log
 └── CLAUDE.md                      # This file
@@ -98,7 +115,7 @@ Single-file, zero-config design. Key classes:
 
 **Auto-discovery** (`auto_discover_uwb`): Enumerates serial ports, probes 7 baud rates (921600→9600), identifies UWB by `$DIST` response. Falls back to platform-appropriate default (`COM3` on Windows, `/dev/ttyUSB0` on Linux).
 
-**GPS emulation output**: Sends standard NMEA sentences (`$GPGGA` + `$GPRMC`) over serial to the flight controller's GPS port. The FC receives them as if from a real GPS module — no MAVLink, no pymavlink dependency. Baud rate defaults to 57600 (matching typical GPS module rates). The GPS port is input-only, so EKF origin must be configured manually in `uwb_config.json`.
+**GPS emulation output**: Sends 3 NMEA sentences per cycle (`$GPGGA` + `$GPRMC` + `$GPVTG`) over serial to the flight controller's GPS port, matching u-blox NEO-M9N NMEA 4.10 format. The FC receives them as if from a real GPS module — no MAVLink, no pymavlink dependency. `$GPVTG` (course/speed) is essential for ArduPilot's NMEA driver. Baud rate defaults to 38400 (matching u-blox NEO-M9N default), but the shipped `uwb_config.json` uses 57600 — ensure it matches the FC's `SERIALx_BAUD`. The GPS port is input-only, so EKF origin must be configured manually in `uwb_config.json`.
 
 **Calibration** (`--calibrate`): Interactive 3-mode menu:
 1. **Step-based**: Move tag origin→X→Y, enter actual measured distance (any distance, not hardcoded 1m)
@@ -109,7 +126,19 @@ Non-interactive equivalents: `--cal-points "x,y,z;..."` and `--set-anchors "x,y,
 
 **Calibration persistence**: Results saved to `uwb_config.json` directly (primary), with `~/.uwb_calib.json` as backup.
 
-**Output channels**: Terminal (always on), UDP JSON broadcast (`127.0.0.1:14550` default), NMEA GPS emulation (serial NMEA sentences to FC GPS port). NMEA is output-only — HOME_POSITION cannot be auto-read; configure `ekf_origin_lat/lon/alt` manually in config. Default baud 38400, matching u-blox NEO-M9N default.
+**Output channels**: Terminal (always on), UDP JSON broadcast (`127.0.0.1:14550` default), NMEA GPS emulation (serial NMEA sentences to FC GPS port). NMEA is output-only — HOME_POSITION cannot be auto-read; configure `ekf_origin_lat/lon/alt` manually in config.
+
+### GPS Fixed Emulator (`UWB/gps_fixed_emu.py`)
+
+Standalone diagnostic tool. Sends a constant GPS position via NMEA (`$GPGGA` + `$GPRMC`) to the flight controller's GPS port — no UWB hardware required. Useful for verifying the FC GPS path works end-to-end before deploying UWB.
+
+```bash
+python UWB/gps_fixed_emu.py COM4                          # Windows, default Nanjing coords
+python UWB/gps_fixed_emu.py /dev/ttyS6 --baud 57600       # Custom baud
+python UWB/gps_fixed_emu.py COM4 --lat 32.1148 --lon 118.9591 --alt 12.0  # Custom position
+python UWB/gps_fixed_emu.py COM4 --rate 5 --verbose        # 5 Hz + print each sentence
+python UWB/gps_fixed_emu.py COM4 --hdop 1.5 --sats 10     # Tune HDOP / satellite count
+```
 
 ### Mission Script (`drone_mission_rectangle.py`)
 
@@ -131,6 +160,11 @@ python UWB/uwb.py --set-anchors "0,0,1.5;2,0,1.5;0,2,1.5;2,2,1.5"
 python UWB/uwb.py --calibrate --cal-points "0,0,0;1.5,0,0;0,2,0"
 python UWB/uwb.py --port /dev/ttyUSB0 --baud 57600 --default-height 1.2
 python UWB/uwb.py --gps-emu-serial /dev/ttyS6 --gps-emu-baud 57600
+python UWB/uwb.py --nmea-hdop 1.5 --nmea-sats 10      # NMEA 参数微调
+
+# ── GPS Diagnostic (no UWB needed) ──
+python UWB/gps_fixed_emu.py COM4               # Constant GPS → FC, verify NMEA path
+python UWB/gps_fixed_emu.py COM4 --lat 32.1 --lon 118.9 --alt 12.0 --rate 5
 
 # ── Mission ──
 python drone_mission_rectangle.py              # Edit CONN/BAUD at file bottom first
@@ -159,8 +193,24 @@ All fields optional. Priority chain: **CLI args > uwb_config.json > ~/.uwb_calib
 | `anchors` | `{"S1":[x,y,z], ...}` — anchor positions (m) | Calibration menu (3 modes) |
 | `output.terminal` | Print to stdout | Always on |
 | `output.udp_broadcast` | UDP JSON (`enabled`, `host`, `port`) | Off by default |
-| `output.gps_emulation` | NMEA GPS emulation (`enabled`, `serial_port`, `serial_baud`) — serial NMEA to FC GPS port | Off by default |
+| `output.gps_emulation` | NMEA GPS emulation (`enabled`, `serial_port`, `serial_baud`, `nmea_hdop`, `nmea_satellites`) — serial NMEA to FC GPS port | Off by default |
 | `ekf_origin_lat/lon/alt` | E7-format GPS reference origin | Must be manually configured for NMEA mode |
+
+NMEA quality-of-signal knobs (in `gps_emulation`):
+- `nmea_hdop` (float, default 1.5) — Horizontal dilution of precision. u-blox typical range 1.0~2.0. Lower = "more trustworthy" signal.
+- `nmea_satellites` (int, default 10) — Visible satellite count. u-blox typical range 8~16.
+
+### STM32 UWB (`stm32_uwb/Core/Inc/uwb_config.h`)
+
+C header with hardcoded anchors and GPS origin — edit before first flash:
+
+```c
+static const float ANCHOR_POSITIONS[4][3] = { {0,0,1.8}, {6,0,1.8}, {0,8,1.8}, {6,8,1.8} };
+#define GPS_ORIGIN_LAT   321148408   // E7 format
+#define GPS_ORIGIN_LON   1189590664
+#define GPS_ORIGIN_ALT   1200        // cm
+```
+
 ## Platform Notes
 
 - **Windows**: Serial ports `COMx`, no permission issues. Default fallback `COM3`.
@@ -176,3 +226,10 @@ All fields optional. Priority chain: **CLI args > uwb_config.json > ~/.uwb_calib
 - **Calibration math**: `_solve_anchors_from_measurements()` is the shared core — given N known tag positions + distances, solves for each anchor's 3D coordinate via least-squares. Used by both step-based and known-points calibration.
 - **Encoding**: Always `open(..., encoding="utf-8")` — Windows defaults to GBK otherwise.
 - **UWB serial protocol**: `$DIST,M1,S<id>,<distance_meters>` with `\n` delimiter. Master ID is always M1 (the drone tag). Anchor IDs are S1–S4.
+- **UWB deployment ladder** (choose by cost/weight constraints):
+  1. **Python** (`uwb.py`) — full EKF, interactive calib, needs Pi/旭日X3 (~¥200+, ~50g)
+  2. **Arduino C++** (`uwb_arduino/`) — dual median filter, needs Arduino board (~¥30, ~10g)
+  3. **STM32 pure C** (`stm32_uwb/`) — dual median filter, Blue Pill (~¥12, ~5g)
+- **NMEA default baud**: Code default is 38400 (u-blox M9N), but `uwb_config.json` ships with 57600. Always verify against FC `SERIALx_BAUD` — mismatch = no GPS fix.
+- **STM32 newlib-nano**: All NMEA `snprintf` uses `%d` integer formatting — no `%f`. A format-float helper (`fmt_1dp`/`fmt_2dp`) writes to temp buffers, then `%s` inserts into sentence templates. Avoids the ~12KB flash cost and potential linker issues of enabling float printf.
+- **STM32 NA guard**: Position output checked with `(x==x && x*0==0)` (NaN → fails equality with self; Inf → Inf×0=NaN). No dependency on `isfinite()` which may be missing in newlib-nano.

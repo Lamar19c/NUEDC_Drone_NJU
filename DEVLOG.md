@@ -496,3 +496,72 @@ USB-TTL GND → GND  |
   - `tag/` — Tag 参考代码（从 Download 复制）
   - `modules/` — 新增功能模块
   - `pcb/` — PCB 设计文档
+
+## 2026-07-08
+
+### NMEA 格式对齐 u-blox NEO-M9N (Python + STM32)
+
+- **问题**：NMEA 伪 GPS 与真实 u-blox 模块存在格式差异，导致飞控频繁报错。
+- **根因**：
+  1. 缺失 `$GPVTG` 语句 — ArduPilot NMEA 驱动必需
+  2. `$GPRMC` 磁偏角字段为 `,,`（空）vs u-blox `0.0,E,A`（显式值 + mode indicator）
+  3. HDOP=1.0 / 卫星数=8 硬编码，值过于"完美"
+- **修复**（三端同步：Python `uwb.py`、`gps_fixed_emu.py`、STM32 `uwb_nmea.c`）：
+  - 新增 `$GPVTG` 语句（course/speed/knots/kmh）
+  - `$GPRMC` 格式：`{date},,,A` → `{date},0.0,E,A`
+  - HDOP / 卫星数可配置：新增 `nmea_hdop`(1.5) / `nmea_satellites`(10) 参数
+  - Python CLI 新增 `--nmea-hdop` / `--nmea-sats`
+- **推荐飞控配置**：`GPS_TYPE=5` (NMEA) — 不用 AUTO=1 避免 u-blox 探测冲突
+
+### STM32 算法修复 — 加权最小二乘权重平方 bug
+
+- **位置**：`uwb_solver.c` 中 `solve_2d` / `solve_3d`
+- **问题**：加权最小二乘的权重 `w = 1/(d+0.1)` 直接乘到系数上，正规方程权重被平方 (`W→W²`)，远距离锚点被过度压低。
+- **修复**：`w = sqrtf(1.0f/(d+0.1f))` — 正规方程权重 = w
+- **Python 同步修复**：`uwb.py` 中 `np.sqrt(1.0/(d+0.1))`
+
+### STM32 距离管理重构 — 超时失效替代主动清空
+
+- **问题**：每次解算后 `uwb_parser_clear_distances()` 清空所有距离，4 锚点系统中第 4 个锚点数据经常来不及到达就被丢弃，系统长期退化为 3 锚点 2D 模式。
+- **修复**：
+  - `UWB_Parser` 新增 `last_update_ms[8]` 逐锚点时间戳
+  - 新增 `DIST_TIMEOUT_MS`(150ms) 超时自动失效
+  - `main.c` 移除 `clear_distances` 调用，改用 `get_valid_distances(now_ms)`
+  - UWB 锚点数据不再丢失，4 锚点始终参与 3D 解算
+
+### STM32 解算增强
+
+- **最近锚点参考**：`solve_3d` 选距离最小的锚点做差分参考基点（提升精度）
+- **残差校验**：新增 `compute_mean_residual()`，超 `RESIDUAL_MAX_3D`(2.0m) / `RESIDUAL_MAX_2D`(1.5m) 丢弃
+- **NaN/Inf 防护**：解算输出 `(x==x && x*0==0)` 可移植校验，异常值不污染滤波窗口
+- **限幅统一**：`local_to_gps` 硬编码 ±20m → 统一用 `POS_CLAMP_MIN/MAX`(±10m)
+- **移除 `mode_2d`** 冗余字段
+
+### STM32 内核优化 — 移除 %f 浮点 printf
+
+- **问题**：`uwb_nmea.h` 中 `snprintf` 使用 `%f`，STM32 newlib-nano 默认不包含浮点 printf 支持
+- **修复**：新增 `fmt_1dp()` / `fmt_2dp()` 整数格式化函数，所有 NMEA 生成改用 `%d` + `%s`
+- **配套修复**：`deg_to_nmea_lat/lon` 分钟进位边界处理（`mm_int>=60 → d++`）、`%04d`→`%04u` 消除 truncation warning
+
+### STM32 头文件 → .h + .c 拆分
+
+- **`uwb_solver.h`**→ struct + declarations only; **`uwb_solver.c`**← all implementations (new)
+- **`uwb_nmea.h`**→ struct + declarations only; **`uwb_nmea.c`**← all implementations (new)
+- Debug 构建系统同步更新 (`subdir.mk`, `objects.list`)
+
+### STM32 非阻塞 DMA NMEA 发送
+
+- **旧逻辑**：DMA 发送后 `while(HAL_UART_GetState != READY)` 死等 50ms × 3 句 = 阻塞主循环
+- **新逻辑**：
+  - `nmea_start_dma_send()` 启动 GGPA DMA 后立即返回
+  - `HAL_UART_TxCpltCallback` ISR 链式触发 RMC → VTG → IDLE
+  - DMA 发送中不覆盖缓冲区 (`nmea_tx_state == NMEA_IDLE` 守卫)
+  - 主循环无阻塞，DMA 在后台完成
+
+### STM32 性能与稳定性优化
+
+- **非阻塞主循环**：`HAL_Delay(20)` → tick-based 时间片调度 (`last_loop_time`)
+- **UART 异常恢复**：`HAL_UART_ErrorCallback` 自动清除/重启（防接收永久中断）
+- **速度独立滤波**：`VelocityFilter` 一阶低通，速度由原始位置差分（跳过 8 窗口中值），滞后减半
+- **预计算常量**：`g_m_per_deg_lon` 首次计算 `cos(lat)`，后续复用
+- **运行时统计**：每 5s 打印 parse/solve/NMEA 成功率

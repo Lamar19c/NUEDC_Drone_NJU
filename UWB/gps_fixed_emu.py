@@ -61,18 +61,22 @@ def build_nmea_sentences(
     alt_m: float,
     speed_kn: float = 0.0,
     course_deg: float = 0.0,
+    hdop: float = 1.5,
+    satellites: int = 10,
     timestamp: float | None = None,
 ) -> tuple:
-    """生成一组 $GPGGA + $GPRMC 语句
+    """生成一组 $GPGGA + $GPRMC + $GPVTG 语句 (与 u-blox NEO-M9N NMEA 4.10 对齐)
 
     参数:
         lat_deg, lon_deg: 十进制度经纬度
         alt_m: 海拔高度(米)
         speed_kn: 地面速率(节)
         course_deg: 地面航向(度, 真北)
+        hdop: 水平精度因子 (1.0~2.0, 默认 1.5)
+        satellites: 可见卫星数 (默认 10)
         timestamp: Unix时间戳, None=当前时间
 
-    返回: (ggpa_str, rmc_str) — 带 \\r\\n 的完整NMEA语句
+    返回: (ggpa_str, rmc_str, vtg_str) — 带 \\r\\n 的完整NMEA语句
     """
     if timestamp is None:
         timestamp = time.time()
@@ -83,21 +87,30 @@ def build_nmea_sentences(
 
     lat_str, lat_dir, lon_str, lon_dir = _deg_to_nmea(lat_deg, lon_deg)
 
+    speed_kmh = speed_kn * 1.852   # knots → km/h
+
     # $GPGGA — GPS Fix Data
-    ggpa = (
+    ggpa_body = (
         f"$GPGGA,{time_str}.00,{lat_str},{lat_dir},{lon_str},{lon_dir},"
-        f"1,08,1.0,{alt_m:.1f},M,0.0,M,,"
+        f"1,{satellites:02d},{hdop:.1f},{alt_m:.1f},M,0.0,M,,"
     )
-    ggpa = f"{ggpa}*{_nmea_checksum(ggpa)}\r\n"
+    ggpa = f"{ggpa_body}*{_nmea_checksum(ggpa_body)}\r\n"
 
     # $GPRMC — Recommended Minimum Navigation Information
-    rmc = (
+    rmc_body = (
         f"$GPRMC,{time_str}.00,A,{lat_str},{lat_dir},{lon_str},{lon_dir},"
-        f"{speed_kn:.2f},{course_deg:.1f},{date_str},,,A"
+        f"{speed_kn:.2f},{course_deg:.1f},{date_str},0.0,E,A"
     )
-    rmc = f"{rmc}*{_nmea_checksum(rmc)}\r\n"
+    rmc = f"{rmc_body}*{_nmea_checksum(rmc_body)}\r\n"
 
-    return (ggpa, rmc)
+    # $GPVTG — Course Over Ground and Ground Speed
+    vtg_body = (
+        f"$GPVTG,{course_deg:.1f},T,0.0,M,"
+        f"{speed_kn:.2f},N,{speed_kmh:.2f},K,A"
+    )
+    vtg = f"{vtg_body}*{_nmea_checksum(vtg_body)}\r\n"
+
+    return (ggpa, rmc, vtg)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -141,6 +154,14 @@ def main():
         "--verbose", action="store_true",
         help="打印每条发送的NMEA语句（诊断用）",
     )
+    parser.add_argument(
+        "--hdop", type=float, default=1.5,
+        help="HDOP 水平精度因子 (默认: 1.5, u-blox 典型范围 1.0~2.0)",
+    )
+    parser.add_argument(
+        "--sats", type=int, default=10,
+        help="可见卫星数 (默认: 10, u-blox 典型范围 8~16)",
+    )
     args = parser.parse_args()
 
     # ── 1. 打开串口 ──
@@ -178,12 +199,14 @@ def main():
     print(f"  ═══════════════════════════════════════")
 
     # ── 3. 预生成 NMEA 样例并打印 ──
-    ggpa_sample, rmc_sample = build_nmea_sentences(
+    ggpa_sample, rmc_sample, vtg_sample = build_nmea_sentences(
         args.lat, args.lon, args.alt, args.speed,
+        hdop=args.hdop, satellites=args.sats,
     )
     print(f"\n  NMEA 样例 (每次发送时时间戳更新):")
     print(f"    {ggpa_sample.strip()}")
     print(f"    {rmc_sample.strip()}")
+    print(f"    {vtg_sample.strip()}")
 
     # ── 4. 主循环 ──
     interval = 1.0 / args.rate
@@ -193,13 +216,15 @@ def main():
     try:
         while True:
             now = time.time()
-            ggpa, rmc = build_nmea_sentences(
-                args.lat, args.lon, args.alt, args.speed, timestamp=now,
+            ggpa, rmc, vtg = build_nmea_sentences(
+                args.lat, args.lon, args.alt, args.speed,
+                hdop=args.hdop, satellites=args.sats, timestamp=now,
             )
 
             try:
                 n1 = ser.write(ggpa.encode("ascii"))
                 n2 = ser.write(rmc.encode("ascii"))
+                n3 = ser.write(vtg.encode("ascii"))
                 ser.flush()  # 强制刷新，确保数据立刻送出
             except (OSError, serial.SerialException) as e:
                 print(f"  ⚠ 串口写入失败 (第{count+1}组): {e}")
@@ -209,15 +234,17 @@ def main():
 
             # 首条：打印实际发送内容 + 字节数
             if count == 1:
-                print(f"  ✓ 首条已发送 ({n1}+{n2}={n1+n2} bytes) → {args.port}")
+                print(f"  ✓ 首条已发送 ({n1}+{n2}+{n3}={n1+n2+n3} bytes) → {args.port}")
                 print(f"    {ggpa.strip()}")
                 print(f"    {rmc.strip()}")
+                print(f"    {vtg.strip()}")
                 print(f"    飞控应能识别GPS定位: {args.lat:.7f}, {args.lon:.7f}")
 
             # --verbose: 每条都打印
             if args.verbose:
                 print(f"  [{count}] {ggpa.strip()}")
                 print(f"  [{count}] {rmc.strip()}")
+                print(f"  [{count}] {vtg.strip()}")
 
             # 定期心跳
             if count % max(1, int(args.rate * 5)) == 0:  # 每5秒

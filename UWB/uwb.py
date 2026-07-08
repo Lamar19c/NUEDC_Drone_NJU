@@ -55,6 +55,8 @@ class AnchorConfig:
     gps_emu_enabled: bool
     gps_emu_serial_port: str
     gps_emu_serial_baud: int
+    nmea_hdop: float         # NMEA 水平精度因子 (u-blox 典型值 1.0~2.0)
+    nmea_satellites: int     # NMEA 可见卫星数 (u-blox 典型值 8~16)
     ekf_origin_lat: int
     ekf_origin_lon: int
     ekf_origin_alt: int
@@ -129,6 +131,8 @@ class AnchorConfig:
             gps_emu_enabled=gps_emu.get("enabled", False),
             gps_emu_serial_port=gps_emu.get("serial_port", "/dev/ttyS6"),
             gps_emu_serial_baud=gps_emu.get("serial_baud", 38400),
+            nmea_hdop=float(gps_emu.get("nmea_hdop", 1.5)),
+            nmea_satellites=int(gps_emu.get("nmea_satellites", 10)),
             ekf_origin_lat=lat,
             ekf_origin_lon=lon,
             ekf_origin_alt=alt,
@@ -597,7 +601,8 @@ class UWBSolver:
         A = np.zeros((len(anchors) - 1, 3))
         b = np.zeros(len(anchors) - 1)
     # 加权系数：测距越小(距离越近)权重越高，抗干扰越强
-        weights = 1.0 / (d[1:] + 0.1)  
+        # 系数乘以 √w，正规方程权重 = w (而非 w²)
+        weights = np.sqrt(1.0 / (d[1:] + 0.1))  
 
         for i in range(1, len(anchors)):
             pi = anchors[i]
@@ -630,7 +635,8 @@ class UWBSolver:
 
         A = np.zeros((2, 2))
         b = np.zeros(2)
-        weights = 1.0 / (d[1:] + 0.1)
+        # 系数乘以 √w，正规方程权重 = w (而非 w²)
+        weights = np.sqrt(1.0 / (d[1:] + 0.1))
 
         for i in range(1, 3):
             pi = anchors[i]
@@ -909,9 +915,14 @@ class OutputRouter:
     def _send_nmea_sentences(self, x: float, y: float, z: float,
                               vx: float, vy: float, vz: float,
                               timestamp: float) -> None:
-        """生成并发送 $GPGGA + $GPRMC NMEA 语句到飞控 GPS 端口"""
+        """生成并发送 $GPGGA + $GPRMC + $GPVTG NMEA 语句到飞控 GPS 端口
+
+        三语句格式与 u-blox NEO-M9N 默认输出保持一致:
+          $GPGGA — 定位数据 (时间、经纬度、高度、HDOP、卫星数)
+          $GPRMC — 推荐最小导航数据 (位置、地速、航向、磁偏角)
+          $GPVTG — 对地速度与航向 (u-blox 必发，ArduPilot NMEA 驱动必需)
+        """
         if not self._gps_serial or not self._gps_serial.is_open:
-            # 串口未就绪，首次告警一次
             if self.config.gps_emu_enabled and not self._gps_init_failed:
                 print("  ⚠ NMEA 串口已断开，GPS 模拟中断")
                 self._gps_init_failed = True
@@ -940,26 +951,42 @@ class OutputRouter:
         time_str = time.strftime("%H%M%S", dt)
         date_str = time.strftime("%d%m%y", dt)
 
-        # 4. 速度 (m/s → knots, 水平合成)
+        # 4. 速度 (m/s → knots/kmh, 水平合成)
         speed_ms = math.sqrt(vx * vx + vy * vy)
-        speed_kn = speed_ms * 1.94384
+        speed_kn = speed_ms * 1.94384    # m/s → knots
+        speed_kmh = speed_ms * 3.6       # m/s → km/h
         course = math.degrees(math.atan2(vx, vy))  # 东/北 → 真北角
         if course < 0:
             course += 360
 
-        # 5. 组装 NMEA 语句
-        ggpa = f"$GPGGA,{time_str}.00,{lat_str},{lat_dir},{lon_str},{lon_dir}," \
-               f"1,08,1.0,{alt_m:.1f},M,0.0,M,,"
-        ggpa = f"{ggpa}*{_nmea_checksum(ggpa)}\r\n"
+        hdop = self.config.nmea_hdop
+        sats = self.config.nmea_satellites
 
-        rmc = f"$GPRMC,{time_str}.00,A,{lat_str},{lat_dir},{lon_str},{lon_dir}," \
-              f"{speed_kn:.2f},{course:.1f},{date_str},,,A"
-        rmc = f"{rmc}*{_nmea_checksum(rmc)}\r\n"
+        # 5. 组装 NMEA 语句 (与 u-blox NEO-M9N NMEA 4.10 格式对齐)
+
+        # $GPGGA — GPS Fix Data
+        # 格式: time,lat,N,lon,E,quality,sats,hdop,alt,M,geoid,M,age,refid
+        ggpa_body = (f"$GPGGA,{time_str}.00,{lat_str},{lat_dir},{lon_str},{lon_dir},"
+                     f"1,{sats:02d},{hdop:.1f},{alt_m:.1f},M,0.0,M,,")
+        ggpa = f"{ggpa_body}*{_nmea_checksum(ggpa_body)}\r\n"
+
+        # $GPRMC — Recommended Minimum Navigation Information
+        # 格式: time,status,lat,N,lon,E,speed,course,date,magvar,magdir,mode
+        rmc_body = (f"$GPRMC,{time_str}.00,A,{lat_str},{lat_dir},{lon_str},{lon_dir},"
+                    f"{speed_kn:.2f},{course:.1f},{date_str},0.0,E,A")
+        rmc = f"{rmc_body}*{_nmea_checksum(rmc_body)}\r\n"
+
+        # $GPVTG — Course Over Ground and Ground Speed
+        # 格式: cogt,T,cogm,M,sog,N,sogk,K,mode
+        vtg_body = (f"$GPVTG,{course:.1f},T,0.0,M,"
+                    f"{speed_kn:.2f},N,{speed_kmh:.2f},K,A")
+        vtg = f"{vtg_body}*{_nmea_checksum(vtg_body)}\r\n"
 
         # 6. 发送
         try:
             self._gps_serial.write(ggpa.encode("ascii"))
             self._gps_serial.write(rmc.encode("ascii"))
+            self._gps_serial.write(vtg.encode("ascii"))
             self._nmea_sent_count += 1
             self._nmea_fail_count = 0
             self._gps_init_failed = False  # 写入成功，清除故障标记
@@ -968,7 +995,8 @@ class OutputRouter:
             if self._nmea_sent_count == 1:
                 print(f"\n  ✓ NMEA 首条已发送:")
                 print(f"    {ggpa.strip()}")
-                print(f"    {rmc.strip()}\n")
+                print(f"    {rmc.strip()}")
+                print(f"    {vtg.strip()}\n")
 
             # 定期心跳 (每 ~5s = 每 25 条 @ 5Hz)
             if self._nmea_sent_count % 25 == 0:
@@ -1069,6 +1097,10 @@ def main():
                         help="飞控 GPS 串口设备 (如 /dev/ttyS6, COM4)")
     parser.add_argument("--gps-emu-baud", type=int, default=None,
                         help="飞控 GPS 串口波特率 (默认: 57600)")
+    parser.add_argument("--nmea-hdop", type=float, default=None,
+                        help="NMEA 水平精度因子 HDOP (默认: 1.5, u-blox 典型范围 1.0~2.0)")
+    parser.add_argument("--nmea-sats", type=int, default=None,
+                        help="NMEA 可见卫星数 (默认: 10, u-blox 典型范围 8~16)")
     args = parser.parse_args()
 
     # ---- calibrate / set-anchors mode: configure anchors, save cache, exit ----
@@ -1138,6 +1170,10 @@ def main():
         cfg.gps_emu_serial_port = args.gps_emu_serial
     if args.gps_emu_baud:
         cfg.gps_emu_serial_baud = args.gps_emu_baud
+    if args.nmea_hdop is not None:
+        cfg.nmea_hdop = args.nmea_hdop
+    if args.nmea_sats is not None:
+        cfg.nmea_satellites = args.nmea_sats
 
     positions = cfg.anchor_positions()
     n_anchors = positions.shape[0]

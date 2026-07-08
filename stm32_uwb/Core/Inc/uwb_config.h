@@ -41,6 +41,8 @@ static const float ANCHOR_POSITIONS[ANCHOR_COUNT][3] = {
 #define DIST_WINDOW_SIZE  8
 #define MAX_DIST_JUMP     0.8f
 #define POS_WINDOW_SIZE   8
+#define DIST_TIMEOUT_MS   150       /* 锚点距离超时 (ms)，超过此值视为失效 */
+#define VEL_ALPHA         0.3f      /* 速度一阶低通系数 (0~1, 越大越灵敏) */
 
 /* ========================================================================
  * 4. 数学常量 (Arduino 兼容)
@@ -61,6 +63,8 @@ static const float ANCHOR_POSITIONS[ANCHOR_COUNT][3] = {
 #define GPS_ORIGIN_LON   1189590664  /* 118.9590664° (E7) */
 #define GPS_ORIGIN_ALT   1200        /* 12.0m (cm) */
 #define NMEA_RATE_HZ     5.0f
+#define NMEA_HDOP        1.5f        /* HDOP 水平精度因子 (u-blox 典型 1.0~2.0) */
+#define NMEA_SATELLITES  10          /* 可见卫星数 (u-blox 典型 8~16) */
 
 /* ========================================================================
  * 6. 主循环

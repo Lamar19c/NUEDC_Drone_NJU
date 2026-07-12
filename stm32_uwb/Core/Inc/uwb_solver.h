@@ -34,6 +34,8 @@ int  uwb_parser_get_valid_distances(struct UWB_Parser *p, float out[],
 struct DistanceFilter {
     float window[DIST_WINDOW_SIZE][8];
     int   window_count;
+    float ema[8];          /* per-anchor EMA-smoothed distance */
+    int   ema_ready[8];    /* per-anchor EMA init flag */
 };
 
 void dist_filter_init(struct DistanceFilter *df);
@@ -79,7 +81,10 @@ struct UWBSolver {
     struct PositionFilter pos_filter;
     float         last_x, last_y, last_z;      /* filtered position */
     float         last_raw_x, last_raw_y, last_raw_z;  /* raw for velocity */
+    float         ax_x, ay_y, az_z;            /* α-β position state */
+    float         ax_vx, ay_vy, az_vz;         /* α-β velocity state */
     int           has_last_pos;
+    int           has_ab_state;                /* α-β filter initialised */
 };
 
 void uwb_solver_init(struct UWBSolver *s, const float anchors[][3], int count);
@@ -87,5 +92,11 @@ int  uwb_solver_solve(struct UWBSolver *s, const float distances[],
                        unsigned long now_ms,
                        float *x, float *y, float *z,
                        float *vx, float *vy, float *vz);
+
+/* ---- diagnostic globals (read from main loop, written by parser ISR) ---- */
+extern char     g_uwb_last_raw_line[64];
+extern int      g_uwb_has_raw_line;
+extern uint32_t g_parser_line_ok;
+extern uint32_t g_parser_line_bad;
 
 #endif /* UWB_SOLVER_H */

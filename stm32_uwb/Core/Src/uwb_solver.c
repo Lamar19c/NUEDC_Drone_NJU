@@ -10,6 +10,11 @@
 
 /* ---- 内部 helper: 中位数计算 ---- */
 
+char     g_uwb_last_raw_line[64] = {0};
+int      g_uwb_has_raw_line     = 0;
+uint32_t g_parser_line_ok       = 0;
+uint32_t g_parser_line_bad      = 0;
+
 static float median_float(float arr[], int n) {
     float sorted[16];  /* max(DIST_WINDOW_SIZE, POS_WINDOW_SIZE) = 8 */
     for (int i = 0; i < n; i++) sorted[i] = arr[i];
@@ -48,8 +53,18 @@ static int uwb_parser_parse_line(struct UWB_Parser *p, const char *line,
                                   uint32_t now_ms) {
     if (line[0] != '$' || line[1] != 'D' || line[2] != 'I' ||
         line[3] != 'S' || line[4] != 'T' || line[5] != ',') {
+        /* capture raw line for diagnostic */
+        if (line[0] != '\0') {
+            int i;
+            for (i = 0; line[i] && i < 63; i++)
+                g_uwb_last_raw_line[i] = line[i];
+            g_uwb_last_raw_line[i] = '\0';
+            g_uwb_has_raw_line = 1;
+        }
+        g_parser_line_bad++;
         return 0;
     }
+    g_parser_line_ok++;
 
     const char *ptr = line + 6;  /* skip "$DIST," */
 
@@ -129,6 +144,10 @@ int uwb_parser_get_valid_distances(struct UWB_Parser *p, float out[],
 
 void dist_filter_init(struct DistanceFilter *df) {
     df->window_count = 0;
+    for (int i = 0; i < 8; i++) {
+        df->ema[i]       = 0.0f;
+        df->ema_ready[i] = 0;
+    }
 }
 
 void dist_filter_apply(struct DistanceFilter *df, float raw[], int count) {
@@ -169,6 +188,15 @@ void dist_filter_apply(struct DistanceFilter *df, float raw[], int count) {
         if (fabsf(raw[i] - med) > MAX_DIST_JUMP) {
             raw[i] = med;
         }
+
+        /* per-anchor distance EMA — suppress high-frequency noise */
+        if (!df->ema_ready[i]) {
+            df->ema[i]       = raw[i];
+            df->ema_ready[i] = 1;
+        } else {
+            df->ema[i] += DIST_ALPHA * (raw[i] - df->ema[i]);
+        }
+        raw[i] = df->ema[i];
     }
 }
 
@@ -264,6 +292,7 @@ void uwb_solver_init(struct UWBSolver *s, const float anchors[][3], int count) {
     s->last_x = s->last_y = s->last_z = 0.0f;
     s->last_raw_x = s->last_raw_y = s->last_raw_z = 0.0f;
     s->has_last_pos = 0;
+    s->has_ab_state = 0;
     pos_filter_init(&s->pos_filter);
 }
 
@@ -465,8 +494,40 @@ int uwb_solver_solve(struct UWBSolver *s, const float distances[],
         *vx = *vy = *vz = 0.0f;
     }
 
-    /* position median filter (for NMEA position output only) */
+    /* position median filter (remove outliers) */
     pos_filter_apply(&s->pos_filter, x, y, z);
+
+    /* α-β filter: predict with velocity, correct with measurement
+       x̅ = x̂₋₁ + v̂₋₁·dt      (prediction)
+       r  = z - x̅              (residual)
+       x̂ = x̅ + α·r            (position update)
+       v̂ = v̂₋₁ + (β/dt)·r     (velocity update) */
+    if (!s->has_ab_state) {
+        s->ax_x = *x;  s->ay_y = *y;  s->az_z = *z;
+        s->ax_vx = *vx; s->ay_vy = *vy; s->az_vz = *vz;
+        s->has_ab_state = 1;
+    } else {
+        /* predict */
+        float px = s->ax_x + s->ax_vx * dt;
+        float py = s->ay_y + s->ay_vy * dt;
+        float pz = s->az_z + s->az_vz * dt;
+
+        /* residual */
+        float rx = *x - px;
+        float ry = *y - py;
+        float rz = *z - pz;
+
+        /* update */
+        s->ax_x   += POS_ALPHA * rx;
+        s->ay_y   += POS_ALPHA * ry;
+        s->az_z   += POS_ALPHA * rz;
+        s->ax_vx  += (POS_BETA / dt) * rx;
+        s->ay_vy  += (POS_BETA / dt) * ry;
+        s->az_vz  += (POS_BETA / dt) * rz;
+    }
+    *x = s->ax_x;
+    *y = s->ay_y;
+    *z = s->az_z;
 
     /* store filtered position */
     s->last_x = *x; s->last_y = *y; s->last_z = *z;

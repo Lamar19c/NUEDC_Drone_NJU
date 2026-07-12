@@ -50,14 +50,18 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-/* ---- printf redirect ---- */
+/* ---- printf redirect (non-blocking: debug output is optional) ---- */
 int _write(int fd, char *ptr, int len) {
-    HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, HAL_MAX_DELAY);
+    /* 100ms timeout: enough for ~1KB at 115200, won't hang forever */
+    if (HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, 100) != HAL_OK) {
+        return len;  /* discard silently if timed out */
+    }
     return len;
 }
 
 /* ---- USART2 interrupt receive ---- */
 static uint8_t rx2_char;
+static uint32_t uart2_rx_count = 0;     /* diagnostic: total bytes received */
 
 /* ---- global objects ---- */
 static struct UWB_Parser      parser;
@@ -109,6 +113,7 @@ static void nmea_start_dma_send(const char *ggpa, const char *rmc, const char *v
 /* ---- USART2 receive complete callback ---- */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART2) {
+        uart2_rx_count++;
         uwb_parser_feed(&parser, (char)rx2_char, HAL_GetTick());
         HAL_UART_Receive_IT(&huart2, &rx2_char, 1);
     }
@@ -145,6 +150,12 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
         __HAL_UART_CLEAR_FEFLAG(huart);
         __HAL_UART_CLEAR_NEFLAG(huart);
         HAL_UART_Receive_IT(&huart2, &rx2_char, 1);
+    }
+    if (huart->Instance == USART3) {
+        /* DMA TX error: abort and reset state machine
+           otherwise nmea_tx_state never returns to NMEA_IDLE */
+        HAL_UART_AbortTransmit(&huart3);
+        nmea_tx_state = NMEA_IDLE;
     }
 }
 /* USER CODE END PV */
@@ -284,6 +295,18 @@ int main(void)
                    (long)(alt_mm / 1000),       labs(alt_mm % 1000));
         } else {
             stat_solve_fail++;
+            if (stat_solve_fail <= 5) {
+                int d0 = (int)(distances[0] * 100.0f);
+                int d1 = (int)(distances[1] * 100.0f);
+                int d2 = (int)(distances[2] * 100.0f);
+                int d3 = (int)(distances[3] * 100.0f);
+                printf("  [DIAG] fail #%lu: d=%d.%02d, %d.%02d, %d.%02d, %d.%02d\r\n",
+                       (unsigned long)stat_solve_fail,
+                       d0/100, (d0>=0?d0:-d0)%100,
+                       d1/100, (d1>=0?d1:-d1)%100,
+                       d2/100, (d2>=0?d2:-d2)%100,
+                       d3/100, (d3>=0?d3:-d3)%100);
+            }
         }
     }
 
@@ -325,8 +348,18 @@ int main(void)
         printf("\r\n  === STATS (5s) ===\r\n");
         printf("  parse: ok=%lu err=%lu | solve: ok=%lu fail=%lu\r\n",
                stat_parse_ok, stat_parse_err, stat_solve_ok, stat_solve_fail);
-        printf("  nmea_sent: %lu | dma_state: %d\r\n\r\n",
+        printf("  nmea_sent: %lu | dma_state: %d\r\n",
                stat_nmea_frames, (int)nmea_tx_state);
+        printf("  uart2_rx: %lu bytes | parser: ok=%lu bad=%lu\r\n",
+               uart2_rx_count,
+               (unsigned long)g_parser_line_ok, (unsigned long)g_parser_line_bad);
+        printf("  has_pos: %d | valid_cnt: %d\r\n",
+               has_pos, uwb_parser_valid_count(&parser, HAL_GetTick()));
+        if (g_uwb_has_raw_line) {
+            printf("  last_raw: [%s]\r\n", g_uwb_last_raw_line);
+            g_uwb_has_raw_line = 0;
+        }
+        printf("\r\n");
     }
     /* USER CODE END 3 */
   }

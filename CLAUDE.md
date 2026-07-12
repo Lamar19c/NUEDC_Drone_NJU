@@ -200,16 +200,48 @@ NMEA quality-of-signal knobs (in `gps_emulation`):
 - `nmea_hdop` (float, default 1.5) — Horizontal dilution of precision. u-blox typical range 1.0~2.0. Lower = "more trustworthy" signal.
 - `nmea_satellites` (int, default 10) — Visible satellite count. u-blox typical range 8~16.
 
-### STM32 UWB (`stm32_uwb/Core/Inc/uwb_config.h`)
+### STM32 UWB (`stm32_uwb/`)
 
-C header with hardcoded anchors and GPS origin — edit before first flash:
+**Pin mapping:**
 
-```c
-static const float ANCHOR_POSITIONS[4][3] = { {0,0,1.8}, {6,0,1.8}, {0,8,1.8}, {6,8,1.8} };
-#define GPS_ORIGIN_LAT   321148408   // E7 format
-#define GPS_ORIGIN_LON   1189590664
-#define GPS_ORIGIN_ALT   1200        // cm
+| Pin | Peripheral | Role | Connect to |
+|-----|-----------|------|-----------|
+| PA2 | USART2_TX | (unused standby) | — |
+| PA3 | USART2_RX | UWB data in (19200) | JZM01 module TX |
+| PA9 | USART1_TX | Debug printf (115200) | USB-TTL RX |
+| PA10 | USART1_RX | (unused) | — |
+| PB10 | USART3_TX | NMEA output (57600) | FC GPS port RX |
+| PB11 | USART3_RX | (unused) | — |
+| PA13 | SWDIO | ST-Link debug | — |
+| PA14 | SWCLK | ST-Link debug | — |
+| PC13 | GPIO | Onboard LED (active-low) | — |
+
+**Signal chain (v2):**
+
 ```
+$DIST ─→ USART2 RX ISR ─→ UWB_Parser ─→ Distance median filter (W=5) ─→
+  Distance EMA (α=0.35) ─→ WLSQ trilateration (2D or 3D) ─→
+  Position median filter (W=5) ─→ α-β tracker (α=0.3,β=0.05) ─→
+  local_to_gps (E7) ─→ NMEA $GPGGA/$GPRMC/$GPVTG ─→ USART3 DMA chain → FC
+```
+
+**Filter parameters** (`uwb_config.h`):
+
+| Parameter | Default | Tune up | Tune down |
+|-----------|---------|---------|-----------|
+| `DIST_ALPHA` | 0.35 | More distance smoothing | More responsive |
+| `POS_ALPHA` | 0.30 | More responsive | More position smoothing |
+| `POS_BETA` | 0.05 | Faster velocity adaptation | More velocity stability |
+| `VEL_ALPHA` | 0.30 | NMEA speed more responsive | NMEA speed smoother |
+
+**α-β filter**: predicts position with `x̂ = x̂₋₁ + v̂₋₁·dt`, corrects with measurement. Eliminates stair-step on diagonal trajectories vs pure EMA.
+
+**Key fixes** (2026-07-11):
+- USART3 interrupt enable (NMEA DMA chain was stuck)
+- printf `_write` non-blocking (100ms timeout, no more HAL_MAX_DELAY)
+- USART3 DMA TX error recovery (state machine reset)
+- All printf uses `%d` integer format (newlib-nano compatibility)
+- NaN/Inf guard on solver output: `x==x && x*0==0`
 
 ## Platform Notes
 

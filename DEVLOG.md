@@ -565,3 +565,69 @@ USB-TTL GND → GND  |
 - **速度独立滤波**：`VelocityFilter` 一阶低通，速度由原始位置差分（跳过 8 窗口中值），滞后减半
 - **预计算常量**：`g_m_per_deg_lon` 首次计算 `cos(lat)`，后续复用
 - **运行时统计**：每 5s 打印 parse/solve/NMEA 成功率
+
+## 2026-07-11 — STM32 滤波增强与稳定性修复
+
+### Bug 修复
+
+- **USART3 中断缺失 — NMEA 永久卡死**：
+  - 根因：DMA 发送完成后需 `USART3_TC` 中断触发 `HAL_UART_TxCpltCallback` 推进 GGA→RMC→VTG 链，但 `USART3_IRQn` 从未使能
+  - 修复：`stm32f1xx_it.c` 新增 `USART3_IRQHandler`，`usart.c` MspInit/DeInit 增加中断使能
+
+- **printf 截断 — 1ms 超时不足**：
+  - 根因：`_write()` 使用 1ms 超时（~11 字节），5s 诊断块 300+ 字节被截断为乱码
+  - 修复：超时 → 100ms（兼容 ~1KB 输出，不影响主循环）
+
+- **`%f` 格式不工作**：
+  - 根因：STM32 newlib-nano 不含浮点 printf，`%.2f` 输出为空
+  - 修复：距离诊断改用 `%d.%02d` 整数格式
+
+- **USART3 DMA TX 异常无恢复**：
+  - 修复：`HAL_UART_ErrorCallback` 新增 USART3 分支，`AbortTransmit + nmea_tx_state=NMEA_IDLE`
+
+### 信号处理链升级
+
+**旧链**：距离中值 → WLSQ 求解 → 位置中值 → 纯 EMA
+
+**新链**：
+
+```
+原始距离 → 中值滤波(去刺) → 距离EMA低通(降噪) → WLSQ 求解
+  → 位置中值(去孤) → α-β 滤波(预测+修正) → 输出位置+速度
+```
+
+- **距离 EMA** (`DIST_ALPHA=0.35`)：逐锚点一阶低通，压制 UWB 高频距离噪声
+- **α-β 位置滤波** (`α=0.30, β=0.05`)：
+  - 预测：`x̅ = x̂₋₁ + v̂₋₁·dt`（匀速运动模型外推）
+  - 更新：`x̂ = x̅ + α·(z − x̅)` 且 `v̂ = v̂₋₁ + (β/dt)·(z − x̅)`
+  - 对角线轨迹不再出现阶梯效应，比纯 EMA 滞后更小
+- **中值窗口**：`POS_WINDOW_SIZE` 8→5（减小滞后）
+
+### 调参指南
+
+| 参数 | 默认值 | 调大效果 | 调小效果 |
+|------|--------|---------|---------|
+| `DIST_ALPHA` | 0.35 | 距离更平滑 | 距离更灵敏 |
+| `POS_ALPHA` | 0.30 | 位置更跟手 | 位置更平滑 |
+| `POS_BETA` | 0.05 | 速度适应更快 | 速度更稳定 |
+| `POS_WINDOW_SIZE` | 5 | 去毛刺更强 | 滞后更小 |
+
+### 诊断增强
+
+- 新增 `g_uwb_last_raw_line[64]` — 未匹配 `$DIST` 格式的原始行捕获
+- 新增 `g_parser_line_ok/bad` — 解析成功/失败行计数器
+- 新增 `uart2_rx_count` — USART2 接收字节总数
+- 5s STATS 新增 `valid_cnt`（当前有效锚点数）、`last_raw`（最后异常行）
+- 5s STATS 新增 `parser: ok=X bad=Y`（逐行统计）
+- 前 5 次解算失败自动输出距离快照 `[DIAG] fail #N: d=S1,S2,S3,S4`
+
+### 定位精度验证
+
+- 3 锚点 2D 解算可还原基础拓扑：矩形闭合路径、对角线走向清晰
+- 已知局限：
+  - 锚点单侧布局 → GDOP 随距离恶化，远离锚点区域轨迹发散
+  - 固定 Z 轴 → 高度波动映射为平面误差
+  - 无冗余观测 → 单锚点噪声无校验
+- 性能预期（4 锚点）：残差校验 + 3D 自由 Z → 精度量级提升
+
+Co-Authored-By: Claude <noreply@anthropic.com>

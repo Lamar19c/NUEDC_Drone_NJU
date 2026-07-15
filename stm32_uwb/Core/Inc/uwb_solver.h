@@ -81,9 +81,10 @@ struct UWBSolver {
     struct PositionFilter pos_filter;
     float         last_x, last_y, last_z;      /* filtered position */
     float         last_raw_x, last_raw_y, last_raw_z;  /* raw for velocity */
-    float         smooth_x, smooth_y, smooth_z;  /* EMA-smoothed position */
+    float         smooth_x, smooth_y, smooth_z;  /* EMA position state */
     int           has_last_pos;
     int           has_smooth_pos;
+    int           last_solve_mode;               /* 0=unknown,2=2D,3=3D — hysteresis */
 };
 
 void uwb_solver_init(struct UWBSolver *s, const float anchors[][3], int count);

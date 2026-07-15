@@ -293,6 +293,7 @@ void uwb_solver_init(struct UWBSolver *s, const float anchors[][3], int count) {
     s->last_raw_x = s->last_raw_y = s->last_raw_z = 0.0f;
     s->has_last_pos = 0;
     s->has_smooth_pos = 0;
+    s->last_solve_mode = 0;
     pos_filter_init(&s->pos_filter);
 }
 
@@ -468,11 +469,27 @@ int uwb_solver_solve(struct UWBSolver *s, const float distances[],
     float prev_rx = s->last_raw_x, prev_ry = s->last_raw_y, prev_rz = s->last_raw_z;
     int had_prev = s->has_last_pos;
 
-    /* trilateration */
-    if (valid_cnt == 3) {
-        if (!solve_2d(s, valid_idx, distances, x, y, z)) return 0;
+    /* trilateration with hysteresis — prevent 2D/3D ping-pong */
+    int prefer_2d = 0;
+    if (s->last_solve_mode == 2) {
+        prefer_2d = (valid_cnt < 4);   /* stay 2D unless 4+ anchors */
     } else {
+        prefer_2d = (valid_cnt < 3);   /* stay 3D unless <3 anchors (shouldn't happen) */
+    }
+    if (valid_cnt == 3 && s->last_solve_mode == 0)
+        prefer_2d = 1;                  /* first time with 3 anchors: use 2D */
+
+    if (prefer_2d && valid_cnt >= 3) {
+        if (!solve_2d(s, valid_idx, distances, x, y, z)) return 0;
+        s->last_solve_mode = 2;
+    } else if (valid_cnt >= 4) {
         if (!solve_3d(s, valid_idx, distances, valid_cnt, x, y, z)) return 0;
+        s->last_solve_mode = 3;
+    } else if (valid_cnt == 3) {
+        if (!solve_2d(s, valid_idx, distances, x, y, z)) return 0;
+        s->last_solve_mode = 2;
+    } else {
+        return 0;
     }
 
     /* NaN/Inf guard — prevent contamination of filters.
@@ -494,10 +511,7 @@ int uwb_solver_solve(struct UWBSolver *s, const float distances[],
         *vx = *vy = *vz = 0.0f;
     }
 
-    /* position median filter (remove outliers) */
-    pos_filter_apply(&s->pos_filter, x, y, z);
-
-    /* position EMA low-pass (smooth trajectory, eliminate stair-step) */
+    /* position EMA (skip median — POS_WINDOW_SIZE=1 = passthrough) */
     if (!s->has_smooth_pos) {
         s->smooth_x = *x; s->smooth_y = *y; s->smooth_z = *z;
         s->has_smooth_pos = 1;

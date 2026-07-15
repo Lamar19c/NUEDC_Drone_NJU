@@ -18,10 +18,10 @@
 #define ANCHOR_COUNT 4
 
 static const float ANCHOR_POSITIONS[ANCHOR_COUNT][3] = {
-    {0.0f, 0.0f, 1.5f},   /* S1 — 场地原点 */
+    {0.0f, 0.0f, 1.0f},   /* S1 — 场地原点 */
     {5.0f, 0.0f, 1.5f},   /* S2 — X轴方向 */
     {0.0f, 5.0f, 1.5f},   /* S3 — Y轴方向 */
-    {5.0f, 5.0f, 1.5f},   /* S4 — 对角 */
+    {5.0f, 5.0f, 1.0f},   /* S4 — 对角 */
 };
 
 /* ========================================================================
@@ -31,19 +31,19 @@ static const float ANCHOR_POSITIONS[ANCHOR_COUNT][3] = {
 #define DEFAULT_HEIGHT   1.0f
 #define POS_CLAMP_MIN   -10.0f
 #define POS_CLAMP_MAX    10.0f
-#define RESIDUAL_MAX_3D  2.0f
-#define RESIDUAL_MAX_2D  1.5f
+#define RESIDUAL_MAX_3D  2.5f      /* 放宽残差，提升低速解算成功率 */
+#define RESIDUAL_MAX_2D  2.0f      /* 放宽残差，提升低速解算成功率 */
 
 /* ========================================================================
  * 3. 滤波参数
  * ======================================================================== */
 
-#define DIST_WINDOW_SIZE  5         /* 减小距离中值窗口，降低低速滞后 */
-#define MAX_DIST_JUMP     0.8f
-#define POS_WINDOW_SIZE   3         /* 中值窗口 3(最小值)，消除低速粘滞 */
-#define DIST_ALPHA        0.50f      /* 距离 EMA (加大响应) */
-#define POS_ALPHA         0.55f      /* 位置 EMA (加大响应，低速更跟手) */
-#define DIST_TIMEOUT_MS   400       /* 锚点距离超时 (ms)，延长避免 2D/3D 频繁切换 */
+#define DIST_WINDOW_SIZE  3         /* 低速优化: 减轻距离中值滞后 */
+#define MAX_DIST_JUMP     1.5f      /* 低速优化: 放宽跳变限幅 */
+#define POS_WINDOW_SIZE   1         /* 低速优化: 关闭位置中值(窗口=1即直通) */
+#define DIST_ALPHA        0.65f     /* 低速优化: 距离 EMA 低延迟 */
+#define POS_ALPHA         0.75f     /* 低速优化: 位置 EMA 低延迟 */
+#define DIST_TIMEOUT_MS   800       /* 低速优化: 延长超时，减少锚点掉线 */
 #define VEL_ALPHA         0.3f      /* NMEA 速度 EMA 低通系数 */
 
 /* ========================================================================

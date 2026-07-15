@@ -1,14 +1,5 @@
 /**
  * uwb_solver.c — UWB 三边测量求解器 + 双中值滤波 + 协议解析 (实现)
- *
- * v3 (2026-07-14): 移除 α-β 滤波和距离 EMA，恢复纯双中值滤波
- *   - 距离端: 中值滤波 (W=8) + 跳变限幅，无 EMA
- *   - 位置端: 中值滤波 (W=8)，直接输出
- *   - 速度: 原始位置差分 → 独立 VelocityFilter (不回馈位置)
- *   - 坐标映射: X→Lon(经度), Y→Lat(纬度)
- *
- * TREK1000 迁移版 — 新增 mc 协议解析，兼容 $DIST fallback
- * 直接替换 stm32_uwb/Core/Src/uwb_solver.c 即可
  */
 #include "uwb_solver.h"
 #include "uwb_config.h"
@@ -25,7 +16,7 @@ uint32_t g_parser_line_ok       = 0;
 uint32_t g_parser_line_bad      = 0;
 
 static float median_float(float arr[], int n) {
-    float sorted[16];  /* max(DIST_WINDOW_SIZE, POS_WINDOW_SIZE) = 10 */
+    float sorted[16];  /* max(DIST_WINDOW_SIZE, POS_WINDOW_SIZE) = 8 */
     for (int i = 0; i < n; i++) sorted[i] = arr[i];
     /* bubble sort (n ≤ 8, fast enough) */
     for (int i = 0; i < n - 1; i++) {
@@ -106,72 +97,12 @@ static int uwb_parser_parse_line(struct UWB_Parser *p, const char *line,
     return 1;
 }
 
-/* ========================================================================
- * 1b. TREK1000 mc 协议解析 (新增)
- *
- * mc 帧格式:
- *   mc <valid_hex> <S1_mm_hex> <S2_mm_hex> <S3_mm_hex> <S4_mm_hex>
- *      <lcount_hex> <rnum_hex> <time_hex> t<tag>:a<anchor>\r\n
- *
- * 示例:
- *   mc 0f 0000064a 000005f2 00000680 00000610 000a 01 000001f4 t0:0
- *
- * 所有数值为 HEX 编码，距离单位 mm。
- * ======================================================================== */
-
-static int uwb_parser_parse_mc(struct UWB_Parser *p, const char *line,
-                                uint32_t now_ms) {
-    /* validate frame header "mc " */
-    if (line[0] != 'm' || line[1] != 'c' || line[2] != ' ') return 0;
-
-    const char *ptr = line + 3;
-    char *end;
-
-    /* field 1: valid_mask (1 hex char, bitmask: bit0=S1 .. bit3=S4) */
-    int mask = (int)strtol(ptr, &end, 16);
-    if (ptr == end) return 0;
-    ptr = end;
-
-    /* fields 2-5: 4 distance values (HEX 8-digit, unit: mm) */
-    uint32_t dists[4] = {0};
-    for (int i = 0; i < 4; i++) {
-        while (*ptr == ' ') ptr++;
-        if (*ptr < '0') return 0;
-        dists[i] = (uint32_t)strtol(ptr, &end, 16);
-        if (ptr == end) return 0;
-        ptr = end;
-    }
-
-    /* store valid distances: mm → m */
-    for (int i = 0; i < 4; i++) {
-        if (mask & (1 << i)) {
-            float d = (float)dists[i] / 1000.0f;
-            if (d > 0.0f && d < 50.0f) {
-                p->distances[i]      = d;
-                p->last_update_ms[i] = now_ms;
-            }
-        }
-    }
-
-    g_parser_line_ok++;
-    return 1;
-}
-
 int uwb_parser_feed(struct UWB_Parser *p, char c, uint32_t now_ms) {
     if (c == '\n' || c == '\r') {
         if (p->buffer_idx > 0) {
             p->buffer[p->buffer_idx] = '\0';
             p->buffer_idx = 0;
-
-            /* ─── TREK1000 migration: route mc frames ─── */
-            if (p->buffer[0] == 'm' && p->buffer[1] == 'c')
-                return uwb_parser_parse_mc(p, p->buffer, now_ms);
-
-            /* fallback: JZM01 $DIST */
-            if (p->buffer[0] == '$')
-                return uwb_parser_parse_line(p, p->buffer, now_ms);
-
-            return 0;
+            return uwb_parser_parse_line(p, p->buffer, now_ms);
         }
         return 0;
     }
@@ -213,6 +144,10 @@ int uwb_parser_get_valid_distances(struct UWB_Parser *p, float out[],
 
 void dist_filter_init(struct DistanceFilter *df) {
     df->window_count = 0;
+    for (int i = 0; i < 8; i++) {
+        df->ema[i]       = 0.0f;
+        df->ema_ready[i] = 0;
+    }
 }
 
 void dist_filter_apply(struct DistanceFilter *df, float raw[], int count) {
@@ -253,6 +188,15 @@ void dist_filter_apply(struct DistanceFilter *df, float raw[], int count) {
         if (fabsf(raw[i] - med) > MAX_DIST_JUMP) {
             raw[i] = med;
         }
+
+        /* per-anchor distance EMA — suppress high-frequency noise */
+        if (!df->ema_ready[i]) {
+            df->ema[i]       = raw[i];
+            df->ema_ready[i] = 1;
+        } else {
+            df->ema[i] += DIST_ALPHA * (raw[i] - df->ema[i]);
+        }
+        raw[i] = df->ema[i];
     }
 }
 
@@ -348,6 +292,7 @@ void uwb_solver_init(struct UWBSolver *s, const float anchors[][3], int count) {
     s->last_x = s->last_y = s->last_z = 0.0f;
     s->last_raw_x = s->last_raw_y = s->last_raw_z = 0.0f;
     s->has_last_pos = 0;
+    s->has_smooth_pos = 0;
     pos_filter_init(&s->pos_filter);
 }
 
@@ -549,8 +494,21 @@ int uwb_solver_solve(struct UWBSolver *s, const float distances[],
         *vx = *vy = *vz = 0.0f;
     }
 
-    /* position median filter (remove outliers) — final output */
+    /* position median filter (remove outliers) */
     pos_filter_apply(&s->pos_filter, x, y, z);
+
+    /* position EMA low-pass (smooth trajectory, eliminate stair-step) */
+    if (!s->has_smooth_pos) {
+        s->smooth_x = *x; s->smooth_y = *y; s->smooth_z = *z;
+        s->has_smooth_pos = 1;
+    } else {
+        s->smooth_x += POS_ALPHA * (*x - s->smooth_x);
+        s->smooth_y += POS_ALPHA * (*y - s->smooth_y);
+        s->smooth_z += POS_ALPHA * (*z - s->smooth_z);
+    }
+    *x = s->smooth_x;
+    *y = s->smooth_y;
+    *z = s->smooth_z;
 
     /* store filtered position */
     s->last_x = *x; s->last_y = *y; s->last_z = *z;

@@ -38,9 +38,11 @@ static const float ANCHOR_POSITIONS[ANCHOR_COUNT][3] = {
  * 3. 滤波参数
  * ======================================================================== */
 
-#define DIST_WINDOW_SIZE  10        /* 距离中值滤波窗口 */
-#define MAX_DIST_JUMP     1.2f      /* 跳变限幅阈值 (m) */
-#define POS_WINDOW_SIZE   10        /* 位置中值滤波窗口 */
+#define DIST_WINDOW_SIZE  8
+#define MAX_DIST_JUMP     0.8f
+#define POS_WINDOW_SIZE   5
+#define DIST_ALPHA        0.35f      /* 距离 EMA 低通系数 */
+#define POS_ALPHA         0.45f      /* 位置 EMA 低通系数 (0~1, 越大越灵敏) */
 #define DIST_TIMEOUT_MS   150       /* 锚点距离超时 (ms)，超过此值视为失效 */
 #define VEL_ALPHA         0.3f      /* NMEA 速度 EMA 低通系数 */
 

@@ -34,6 +34,8 @@ int  uwb_parser_get_valid_distances(struct UWB_Parser *p, float out[],
 struct DistanceFilter {
     float window[DIST_WINDOW_SIZE][8];
     int   window_count;
+    float ema[8];          /* per-anchor EMA-smoothed distance */
+    int   ema_ready[8];    /* per-anchor EMA init flag */
 };
 
 void dist_filter_init(struct DistanceFilter *df);
@@ -79,7 +81,9 @@ struct UWBSolver {
     struct PositionFilter pos_filter;
     float         last_x, last_y, last_z;      /* filtered position */
     float         last_raw_x, last_raw_y, last_raw_z;  /* raw for velocity */
+    float         smooth_x, smooth_y, smooth_z;  /* EMA-smoothed position */
     int           has_last_pos;
+    int           has_smooth_pos;
 };
 
 void uwb_solver_init(struct UWBSolver *s, const float anchors[][3], int count);

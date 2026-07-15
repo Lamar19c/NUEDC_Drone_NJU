@@ -1,0 +1,10 @@
+--- stm32_uwb/stm32_uwb.ioc (原始)
++++ stm32_uwb/stm32_uwb.ioc (TREK1000迁移后)
+@@ -1,2 +1,2 @@
+-USART2.BaudRate=19200
++USART2.BaudRate=115200
+ USART2.IPParameters=VirtualMode,BaudRate
+
+# 说明: CubeMX .ioc 第148行
+# USART2 波特率需从 19200 改为 115200 以匹配 TREK1000 mc 协议
+# 直接编辑 .ioc 文件即可，或在 CubeMX IDE 中修改 USART2 的 Baud Rate

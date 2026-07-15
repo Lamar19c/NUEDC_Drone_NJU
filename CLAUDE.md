@@ -216,12 +216,21 @@ NMEA quality-of-signal knobs (in `gps_emulation`):
 | PA14 | SWCLK | ST-Link debug | — |
 | PC13 | GPIO | Onboard LED (active-low) | — |
 
-**Signal chain (v2):**
+**Coordinate system (STM32 UWB):**
+
+| UWB Axis | Anchor Layout | GPS Mapping | Direction |
+|----------|--------------|-------------|-----------|
+| **X** | S1(0,0) → S2(5,0) | → Longitude (经度) | 东西 (East/West) |
+| **Y** | S1(0,0) → S3(0,-5) | → Latitude (纬度) | 南北 (North/South) |
+| **Z** | Height above ground | → Altitude (海拔) | 上下 (Up/Down) |
+
+`local_to_gps()` in `uwb_nmea.c`: `lat = origin_lat + Y/m_per_deg_lat`, `lon = origin_lon + X/m_per_deg_lon`. NMEA course = `atan2f(vx, vy)` — angle from Y-axis (North) clockwise. **This differs from NED convention** (NED: X=North, Y=East); the STM32 UWB uses X=East, Y=North to match the anchor physical layout where S2 is east and S3 is south.
+
+**Signal chain (v3 — simplified):**
 
 ```
-$DIST ─→ USART2 RX ISR ─→ UWB_Parser ─→ Distance median filter (W=5) ─→
-  Distance EMA (α=0.35) ─→ WLSQ trilateration (2D or 3D) ─→
-  Position median filter (W=5) ─→ α-β tracker (α=0.3,β=0.05) ─→
+$DIST ─→ USART2 RX ISR ─→ UWB_Parser ─→ Distance median filter (W=8) + jump limit ─→
+  WLSQ trilateration (2D or 3D) ─→ Position median filter (W=8) ─→
   local_to_gps (E7) ─→ NMEA $GPGGA/$GPRMC/$GPVTG ─→ USART3 DMA chain → FC
 ```
 
@@ -229,12 +238,18 @@ $DIST ─→ USART2 RX ISR ─→ UWB_Parser ─→ Distance median filter (W=5)
 
 | Parameter | Default | Tune up | Tune down |
 |-----------|---------|---------|-----------|
-| `DIST_ALPHA` | 0.35 | More distance smoothing | More responsive |
-| `POS_ALPHA` | 0.30 | More responsive | More position smoothing |
-| `POS_BETA` | 0.05 | Faster velocity adaptation | More velocity stability |
+| `MAX_DIST_JUMP` | 0.8m | Allow more jump | Stricter jump rejection |
 | `VEL_ALPHA` | 0.30 | NMEA speed more responsive | NMEA speed smoother |
+| `RESIDUAL_MAX_3D` | 2.0m | Accept noisier solutions | Stricter rejection |
+| `RESIDUAL_MAX_2D` | 1.5m | Accept noisier solutions | Stricter rejection |
 
-**α-β filter**: predicts position with `x̂ = x̂₋₁ + v̂₋₁·dt`, corrects with measurement. Eliminates stair-step on diagonal trajectories vs pure EMA.
+**Design rationale (v3)**: α-β filter and distance EMA removed (2026-07-14) — the α-β filter used noisy raw-position velocity for prediction, creating a positive feedback loop that amplified measurement noise. β/dt (2.5× at 50Hz) magnified position errors in velocity. Pure dual median (distance W=8 + position W=8) provides robust noise suppression without kinematic filter instability. NMEA velocity is still computed from raw position deltas, smoothed through independent VelocityFilter (EMA α=0.3) which does not feed back into position.
+
+**Key fixes** (2026-07-14):
+- **α-β filter removed** — noisy raw-velocity prediction caused feedback amplification of measurement noise; β/dt=2.5× at 50Hz magnified position errors in velocity. Replaced with pure dual median (distance W=8 + position W=8).
+- **Distance EMA removed** — redundant on top of median+跳变限幅, added ~3-sample lag per anchor, desynchronised across anchors causing solver bias.
+- **POS_WINDOW_SIZE restored to 8** (was reduced to 5 in v2 in attempt to fix stair-step, but root cause was α-β velocity feedback).
+- **S3 anchor**: changed from `(0,5,1.5)` to `(0,-5,0)` — Y-axis now points south, X-axis points east. Coordinate mapping: X→Longitude (E/W), Y→Latitude (N/S).
 
 **Key fixes** (2026-07-11):
 - USART3 interrupt enable (NMEA DMA chain was stuck)

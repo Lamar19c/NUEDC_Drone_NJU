@@ -38,12 +38,12 @@ static const float ANCHOR_POSITIONS[ANCHOR_COUNT][3] = {
  * 3. 滤波参数
  * ======================================================================== */
 
-#define DIST_WINDOW_SIZE  8
+#define DIST_WINDOW_SIZE  5         /* 减小距离中值窗口，降低低速滞后 */
 #define MAX_DIST_JUMP     0.8f
-#define POS_WINDOW_SIZE   5
-#define DIST_ALPHA        0.35f      /* 距离 EMA 低通系数 */
-#define POS_ALPHA         0.45f      /* 位置 EMA 低通系数 (0~1, 越大越灵敏) */
-#define DIST_TIMEOUT_MS   150       /* 锚点距离超时 (ms)，超过此值视为失效 */
+#define POS_WINDOW_SIZE   3         /* 中值窗口 3(最小值)，消除低速粘滞 */
+#define DIST_ALPHA        0.50f      /* 距离 EMA (加大响应) */
+#define POS_ALPHA         0.55f      /* 位置 EMA (加大响应，低速更跟手) */
+#define DIST_TIMEOUT_MS   400       /* 锚点距离超时 (ms)，延长避免 2D/3D 频繁切换 */
 #define VEL_ALPHA         0.3f      /* NMEA 速度 EMA 低通系数 */
 
 /* ========================================================================

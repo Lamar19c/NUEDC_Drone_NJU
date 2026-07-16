@@ -318,7 +318,7 @@ int main(void)
         if (nmea_tx_state == NMEA_IDLE) {
             nmea_gen_generate(&nmea, gx, gy, gz, gvx, gvy,
                               GPS_ORIGIN_LAT, GPS_ORIGIN_LON, GPS_ORIGIN_ALT,
-                              now / 1000UL);
+                              now / 1000UL, 1, NMEA_SATELLITES, NMEA_HDOP);
 
             const char *ggpa = nmea_gen_ggpa(&nmea);
             const char *rmc  = nmea_gen_rmc(&nmea);

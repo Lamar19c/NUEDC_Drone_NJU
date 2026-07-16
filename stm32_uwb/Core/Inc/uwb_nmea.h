@@ -17,8 +17,8 @@
  * ======================================================================== */
 
 struct NMEA_Generator {
-    char ggpa[130];
-    char rmc[130];
+    char ggpa[100];
+    char rmc[110];   /* GCC 估计最坏 103 字节，留余量 */
     char vtg[100];
 };
 
@@ -28,8 +28,7 @@ void nmea_gen_generate(struct NMEA_Generator *n,
                        float x, float y, float z,
                        float vx, float vy,
                        int32_t origin_lat, int32_t origin_lon, int32_t origin_alt,
-                       uint32_t now_sec,
-                       int fix_quality, int sats, float hdop);
+                       uint32_t now_sec);
 
 const char* nmea_gen_ggpa(const struct NMEA_Generator *n);
 const char* nmea_gen_rmc(const struct NMEA_Generator *n);

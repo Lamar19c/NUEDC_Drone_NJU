@@ -157,6 +157,7 @@ void dist_filter_apply(struct DistanceFilter *df, float raw[], int count) {
             df->window[df->window_count][i] = raw[i];
         }
         df->window_count++;
+        if (df->window_count < 3) return;
     } else {
         /* shift left, drop oldest */
         for (int w = 0; w < DIST_WINDOW_SIZE - 1; w++) {

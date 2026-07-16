@@ -38,12 +38,12 @@ static const float ANCHOR_POSITIONS[ANCHOR_COUNT][3] = {
  * 3. 滤波参数
  * ======================================================================== */
 
-#define DIST_WINDOW_SIZE  1         /* 直通 — 不引入逐锚点相位滞后 */
-#define MAX_DIST_JUMP     99.0f     /* 直通 — 不跳变限幅 */
-#define POS_WINDOW_SIZE   1         /* 直通 — 不引入位置中值滞后 */
-#define DIST_ALPHA        1.0f      /* 直通 — 逐锚点 EMA 会放大 TDMA 时间偏斜 */
-#define POS_ALPHA         0.55f     /* 位置 EMA 输出平滑 (全局平滑,不影响时偏) */
-#define DIST_TIMEOUT_MS   150       /* 关键: 短超时压缩 TDMA 时窗 → v×T 误差可控 */
+#define DIST_WINDOW_SIZE  3         /* 低速优化: 减轻距离中值滞后 */
+#define MAX_DIST_JUMP     1.5f      /* 低速优化: 放宽跳变限幅 */
+#define POS_WINDOW_SIZE   1         /* 低速优化: 关闭位置中值(窗口=1即直通) */
+#define DIST_ALPHA        0.65f     /* 低速优化: 距离 EMA 低延迟 */
+#define POS_ALPHA         0.75f     /* 低速优化: 位置 EMA 低延迟 */
+#define DIST_TIMEOUT_MS   800       /* 低速优化: 延长超时，减少锚点掉线 */
 #define VEL_ALPHA         0.3f      /* NMEA 速度 EMA 低通系数 */
 
 /* ========================================================================

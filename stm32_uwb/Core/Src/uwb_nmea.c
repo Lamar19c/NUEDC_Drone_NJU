@@ -39,51 +39,30 @@ static int fmt_2dp(char *buf, float val) {
  * 2. 坐标格式转换
  * ======================================================================== */
 
-/*
- * v3 高精度坐标转换
- *
- * 直接吃 int32 E7 经纬度，全程 int64 整数运算，绝不经过 float32。
- * 旧版 (float)e7/1e7f 会把 ~3.2e8 / ~1.19e9 的 E7 值塞进 24 位尾数，
- * 纬度 ULP ~0.42m、经度 ULP ~0.72m，直接吸附成矩形栅格，是低速轨迹
- * 抖动/不准的主因之一。
- *
- * 分小数位由 4 位提到 6 位 (0.0001' -> 0.000001')，量化步进由 ~18cm
- * 降到 ~1.9mm，远小于 UWB 本身噪声。ArduPilot 的 NMEA 解析按位读取
- * 小数分，位数不限，6 位安全。
- *
- * deg_width = 2 (纬度 ddmm.mmmmmm) 或 3 (经度 dddmm.mmmmmm)。
- */
-static void e7_to_nmea(int32_t deg_e7, int deg_width,
-                       char pos_dir, char neg_dir, char *out) {
-    char    dir = (deg_e7 >= 0) ? pos_dir : neg_dir;
-    int64_t a   = deg_e7;
-    if (a < 0) a = -a;
-
-    int32_t deg_int     = (int32_t)(a / 10000000);   /* 整度 */
-    int64_t deg_frac_e7 = a % 10000000;              /* 小数度 * 1e7 */
-
-    /* 小数度 -> 分 * 1e7，最大 9999999*60 = 5.99999940e8，int64 稳 */
-    int64_t min_e7      = deg_frac_e7 * 60;
-    int32_t min_int     = (int32_t)(min_e7 / 10000000);   /* 整分 0..59 */
-    int64_t min_frac_e7 = min_e7 % 10000000;              /* 小数分 * 1e7 */
-
-    /* 取 6 位小数分 (小数分 * 1e6)，四舍五入 */
-    int32_t min_frac6 = (int32_t)((min_frac_e7 + 5) / 10);  /* 0..1000000 */
-    if (min_frac6 >= 1000000) { min_frac6 -= 1000000; min_int++; }
-    if (min_int   >= 60)      { min_int   -= 60;       deg_int++; }
-
-    if (deg_width == 3)
-        snprintf(out, 24, "%03d%02d.%06d,%c", (int)deg_int, (int)min_int, (int)min_frac6, dir);
-    else
-        snprintf(out, 24, "%02d%02d.%06d,%c", (int)deg_int, (int)min_int, (int)min_frac6, dir);
+static void deg_to_nmea_lat(float deg, char *out) {
+    float a = fabsf(deg);
+    int d = (int)a;
+    float mm = (a - (float)d) * 60.0f;
+    int mm_int = (int)mm;
+    int mm_frac_raw = (int)roundf((mm - (float)mm_int) * 10000.0f);
+    unsigned int mm_frac = (mm_frac_raw < 0) ? 0 : ((mm_frac_raw > 9999) ? 9999 : (unsigned int)mm_frac_raw);
+    if (mm_frac >= 10000) { mm_int++; mm_frac = 0; }
+    if (mm_int >= 60) { d++; mm_int = 0; }  /* 分钟满 60 向度进位 */
+    char dir = (deg >= 0.0f) ? 'N' : 'S';
+    snprintf(out, 24, "%02d%02d.%04u,%c", d, mm_int, mm_frac, dir);
 }
 
-static void deg_to_nmea_lat(int32_t lat_e7, char *out) {
-    e7_to_nmea(lat_e7, 2, 'N', 'S', out);
-}
-
-static void deg_to_nmea_lon(int32_t lon_e7, char *out) {
-    e7_to_nmea(lon_e7, 3, 'E', 'W', out);
+static void deg_to_nmea_lon(float deg, char *out) {
+    float a = fabsf(deg);
+    int d = (int)a;
+    float mm = (a - (float)d) * 60.0f;
+    int mm_int = (int)mm;
+    int mm_frac_raw = (int)roundf((mm - (float)mm_int) * 10000.0f);
+    unsigned int mm_frac = (mm_frac_raw < 0) ? 0 : ((mm_frac_raw > 9999) ? 9999 : (unsigned int)mm_frac_raw);
+    if (mm_frac >= 10000) { mm_int++; mm_frac = 0; }
+    if (mm_int >= 60) { d++; mm_int = 0; }  /* 分钟满 60 向度进位 */
+    char dir = (deg >= 0.0f) ? 'E' : 'W';
+    snprintf(out, 24, "%03d%02d.%04u,%c", d, mm_int, mm_frac, dir);
 }
 
 static uint8_t nmea_xor_checksum(const char *s) {
@@ -169,22 +148,18 @@ void nmea_gen_generate(struct NMEA_Generator *n,
                        float x, float y, float z,
                        float vx, float vy,
                        int32_t origin_lat, int32_t origin_lon, int32_t origin_alt,
-                       uint32_t now_sec,
-                       int fix_quality, int sats, float hdop) {
-    /* fix_quality: 0=无效(失锁), 1=有效。sats/hdop 由 EKF 健康度实时给出，
-     * 失锁时如实反映，避免地面站把冻结/发散的位置当成健康 GPS。 */
-    if (fix_quality < 0) fix_quality = 0;
-    if (sats < 0) sats = 0;
-    if (hdop < 0.1f) hdop = 0.1f;
-    char status = (fix_quality > 0) ? 'A' : 'V';
+                       uint32_t now_sec) {
     /* Step 1: UWB → GPS (E7) */
     int32_t lat_e7, lon_e7, alt_mm;
     local_to_gps(x, y, z, origin_lat, origin_lon, origin_alt, &lat_e7, &lon_e7, &alt_mm);
 
-    /* Step 2: E7 → NMEA ddmm.mmmmmm (int64 全整数，不经 float32) */
+    /* Step 2: E7 → NMEA ddmm.mmmm */
+    float lat_deg = (float)lat_e7 / 1e7f;
+    float lon_deg = (float)lon_e7 / 1e7f;
+
     char lat_str[24], lon_str[24];
-    deg_to_nmea_lat(lat_e7, lat_str);
-    deg_to_nmea_lon(lon_e7, lon_str);
+    deg_to_nmea_lat(lat_deg, lat_str);
+    deg_to_nmea_lon(lon_deg, lon_str);
 
     /* Step 3: Timestamp (seconds → HHMMSS) */
     unsigned long now = now_sec;
@@ -212,7 +187,7 @@ void nmea_gen_generate(struct NMEA_Generator *n,
     char alt_str[12], hdop_str[12];
     char spd_str[12], crs_str[12], spdkm_str[12];
     fmt_1dp(alt_str,  alt_m);
-    fmt_2dp(hdop_str, hdop);
+    fmt_1dp(hdop_str, NMEA_HDOP);
     fmt_2dp(spd_str,  speed_kn);
     fmt_1dp(crs_str,  course);
     fmt_2dp(spdkm_str, speed_kmh);
@@ -220,16 +195,15 @@ void nmea_gen_generate(struct NMEA_Generator *n,
     /* Step 6: $GPGGA — GPS Fix Data
      * Format: time,lat,N,lon,E,quality,sats,hdop,alt,M,geoid,M,age,refid */
     snprintf(n->ggpa, sizeof(n->ggpa),
-             "$GPGGA,%s.00,%s,%s,%d,%02d,%s,%s,M,0.0,M,,*",
-             time_str, lat_str, lon_str, fix_quality, sats, hdop_str, alt_str);
+             "$GPGGA,%s.00,%s,%s,1,%02d,%s,%s,M,0.0,M,,*",
+             time_str, lat_str, lon_str, NMEA_SATELLITES, hdop_str, alt_str);
     nmea_checksum_append(n->ggpa);
 
     /* Step 7: $GPRMC — Recommended Minimum Navigation Information
      * Format: time,status,lat,N,lon,E,speed,course,date,magvar,magdir,mode */
     snprintf(n->rmc, sizeof(n->rmc),
-             "$GPRMC,%s.00,%c,%s,%s,%s,%s,%s,0.0,E,%c*",
-             time_str, status, lat_str, lon_str, spd_str, crs_str, date_str,
-             (fix_quality > 0) ? 'A' : 'N');
+             "$GPRMC,%s.00,A,%s,%s,%s,%s,%s,0.0,E,A*",
+             time_str, lat_str, lon_str, spd_str, crs_str, date_str);
     nmea_checksum_append(n->rmc);
 
     /* Step 8: $GPVTG — Course Over Ground and Ground Speed

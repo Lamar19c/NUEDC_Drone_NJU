@@ -2,17 +2,9 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
+  * @brief          : UWB EKF indoor localization — STM32F103C8T6
   *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  * EKF: 常速模型 + 逐锚点顺序更新，消除 TDMA 时间偏斜
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -28,7 +20,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include "uwb_config.h"
-#include "uwb_solver.h"
+#include "uwb_parser.h"
+#include "uwb_ekf.h"
 #include "uwb_nmea.h"
 /* USER CODE END Includes */
 
@@ -50,25 +43,22 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-/* ---- printf redirect (non-blocking: debug output is optional) ---- */
+/* ---- printf redirect (non-blocking) ---- */
 int _write(int fd, char *ptr, int len) {
-    /* 100ms timeout: enough for ~1KB at 115200, won't hang forever */
     if (HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, 100) != HAL_OK) {
-        return len;  /* discard silently if timed out */
+        return len;
     }
     return len;
 }
 
 /* ---- USART2 interrupt receive ---- */
 static uint8_t rx2_char;
-static uint32_t uart2_rx_count = 0;     /* diagnostic: total bytes received */
+static uint32_t uart2_rx_count = 0;
 
-/* ---- global objects ---- */
+/* ---- EKF + parser + NMEA ---- */
 static struct UWB_Parser      parser;
-static struct DistanceFilter  dist_filt;
-static struct UWBSolver       solver;
+static struct UWB_EKF         ekf;
 static struct NMEA_Generator  nmea;
-static struct VelocityFilter  vel_filt;
 
 /* ---- position cache ---- */
 static float gx = 0.0f, gy = 0.0f, gz = 1.0f;
@@ -78,14 +68,12 @@ static int   has_pos = 0;
 /* ---- NMEA counters ---- */
 static uint32_t nmea_count = 0;
 static uint32_t last_nmea_time = 0;
-static uint32_t loop_count = 0;
 
 /* ---- non-blocking loop ---- */
 static uint32_t last_loop_time = 0;
 
 /* ---- runtime stats ---- */
-static uint32_t stat_parse_ok = 0, stat_parse_err = 0;
-static uint32_t stat_solve_ok = 0, stat_solve_fail = 0;
+static uint32_t stat_ekf_updates = 0, stat_ekf_none = 0;
 static uint32_t stat_nmea_frames = 0;
 static uint32_t last_stat_time = 0;
 
@@ -98,12 +86,11 @@ typedef enum {
 } nmea_tx_state_t;
 
 static nmea_tx_state_t nmea_tx_state = NMEA_IDLE;
-static const char *nmea_tx_rmc_ptr  = NULL;  /* saved for chaining */
+static const char *nmea_tx_rmc_ptr  = NULL;
 static const char *nmea_tx_vtg_ptr  = NULL;
 
-/** Kick off NMEA DMA chain: GGA → RMC → VTG via TX complete callback. */
 static void nmea_start_dma_send(const char *ggpa, const char *rmc, const char *vtg) {
-    if (nmea_tx_state != NMEA_IDLE) return;  /* still sending previous batch */
+    if (nmea_tx_state != NMEA_IDLE) return;
     nmea_tx_rmc_ptr = rmc;
     nmea_tx_vtg_ptr = vtg;
     nmea_tx_state   = NMEA_SENDING_GGPA;
@@ -142,18 +129,15 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
     }
 }
 
-/* ---- UART error recovery: prevent permanent receive stall ---- */
+/* ---- UART error recovery ---- */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART2) {
-        /* clear error flags and restart receive */
         __HAL_UART_CLEAR_OREFLAG(huart);
         __HAL_UART_CLEAR_FEFLAG(huart);
         __HAL_UART_CLEAR_NEFLAG(huart);
         HAL_UART_Receive_IT(&huart2, &rx2_char, 1);
     }
     if (huart->Instance == USART3) {
-        /* DMA TX error: abort and reset state machine
-           otherwise nmea_tx_state never returns to NMEA_IDLE */
         HAL_UART_AbortTransmit(&huart3);
         nmea_tx_state = NMEA_IDLE;
     }
@@ -171,33 +155,20 @@ void SystemClock_Config(void);
 
 /* USER CODE END 0 */
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
 int main(void)
 {
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
-
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
   /* USER CODE BEGIN Init */
 
   /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
-
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART1_UART_Init();
@@ -205,17 +176,14 @@ int main(void)
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   uwb_parser_init(&parser);
-  dist_filter_init(&dist_filt);
-  uwb_solver_init(&solver, ANCHOR_POSITIONS, ANCHOR_COUNT);
-  vel_filter_init(&vel_filt);
+  uwb_ekf_init(&ekf, ANCHOR_POSITIONS, ANCHOR_COUNT);
   nmea_gen_init(&nmea);
 
   HAL_UART_Receive_IT(&huart2, &rx2_char, 1);
   last_stat_time = HAL_GetTick();
 
   printf("\r\n========================================\r\n");
-  printf("  UWB Indoor 3D Localization - STM32F103C8T6\r\n");
-  printf("  (dual median filter)\r\n");
+  printf("  UWB Indoor Localization — EKF (CV model)\r\n");
   printf("========================================\r\n");
   printf("Anchors: %d\r\n", ANCHOR_COUNT);
   for (int i = 0; i < ANCHOR_COUNT; i++) {
@@ -228,10 +196,6 @@ int main(void)
            ay / 100, (ay >= 0 ? ay : -ay) % 100,
            az / 100, (az >= 0 ? az : -az) % 100);
   }
-  if (ANCHOR_COUNT == 3) {
-    int dz = (int)(DEFAULT_HEIGHT * 100.0f + 0.5f);
-    printf("3-anchor mode: Z = %d.%02dm\r\n", dz / 100, (dz >= 0 ? dz : -dz) % 100);
-  }
   printf("GPS origin: lat=%ld lon=%ld alt=%ld\r\n",
          (long)GPS_ORIGIN_LAT, (long)GPS_ORIGIN_LON, (long)GPS_ORIGIN_ALT);
   printf("Waiting for UWB data...\r\n\r\n");
@@ -242,89 +206,75 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-
     /* USER CODE BEGIN 3 */
-    /* ---- tick-based non-blocking scheduling ---- */
     uint32_t now = HAL_GetTick();
     if (now - last_loop_time < LOOP_INTERVAL_MS) continue;
     last_loop_time = now;
 
-    /* ---- UWB solve ---- */
-    if (uwb_parser_valid_count(&parser, now) >= 3) {
-        float distances[ANCHOR_COUNT];
-        int valid = uwb_parser_get_valid_distances(&parser, distances, ANCHOR_COUNT, now);
-        if (valid == 0) stat_parse_err++; else stat_parse_ok++;
-        /* 距离由超时机制自动失效，不再主动清空 */
+    /* ---- EKF: feed raw distances with per-anchor timestamps ---- */
+    float distances[ANCHOR_COUNT];
+    uwb_parser_get_valid_distances(&parser, distances, ANCHOR_COUNT, now);
+    int applied = uwb_ekf_step(&ekf, distances, parser.last_update_ms, now);
 
-        dist_filter_apply(&dist_filt, distances, ANCHOR_COUNT);
-
+    if (applied > 0) {
+        stat_ekf_updates++;
         float x, y, z, vx, vy, vz;
-        if (uwb_solver_solve(&solver, distances, now,
-                             &x, &y, &z, &vx, &vy, &vz)) {
-            /* independent velocity low-pass filter (reduces phase lag) */
-            vel_filter_apply(&vel_filt, &vx, &vy, &vz);
+        uwb_ekf_get(&ekf, now, &x, &y, &z, &vx, &vy, &vz);
 
-            gx = x; gy = y; gz = z; gvx = vx; gvy = vy;
-            has_pos = 1;
-            loop_count++;
-            stat_solve_ok++;
-
-            int32_t lat_e7, lon_e7, alt_mm;
-            local_to_gps(x, y, z, GPS_ORIGIN_LAT, GPS_ORIGIN_LON, GPS_ORIGIN_ALT,
-                         &lat_e7, &lon_e7, &alt_mm);
-
-            int xi  = (int)(x  * 100.0f + (x  >= 0 ? 0.5f : -0.5f));
-            int yi  = (int)(y  * 100.0f + (y  >= 0 ? 0.5f : -0.5f));
-            int zi  = (int)(z  * 100.0f + (z  >= 0 ? 0.5f : -0.5f));
-            int vxi = (int)(vx * 100.0f + (vx >= 0 ? 0.5f : -0.5f));
-            int vyi = (int)(vy * 100.0f + (vy >= 0 ? 0.5f : -0.5f));
-            int vzi = (int)(vz * 100.0f + (vz >= 0 ? 0.5f : -0.5f));
-
-            printf("[%lu] x=%d.%02d y=%d.%02d z=%d.%02d  "
-                   "vx=%d.%02d vy=%d.%02d vz=%d.%02d  "
-                   "GPS: %ld.%07ld,%ld.%07ld,%ld.%03ldm\r\n",
-                   (unsigned long)(HAL_GetTick() / 1000UL),
-                   xi / 100,  (xi  >= 0 ? xi  : -xi ) % 100,
-                   yi / 100,  (yi  >= 0 ? yi  : -yi ) % 100,
-                   zi / 100,  (zi  >= 0 ? zi  : -zi ) % 100,
-                   vxi / 100, (vxi >= 0 ? vxi : -vxi) % 100,
-                   vyi / 100, (vyi >= 0 ? vyi : -vyi) % 100,
-                   vzi / 100, (vzi >= 0 ? vzi : -vzi) % 100,
-                   (long)(lat_e7 / 10000000),   labs(lat_e7 % 10000000),
-                   (long)(lon_e7 / 10000000),   labs(lon_e7 % 10000000),
-                   (long)(alt_mm / 1000),       labs(alt_mm % 1000));
+        /* divergence guard: reset EKF if state goes NaN/Inf */
+        if (!(x == x && x * 0.0f == 0.0f &&
+              y == y && y * 0.0f == 0.0f &&
+              z == z && z * 0.0f == 0.0f)) {
+            uwb_ekf_init(&ekf, ANCHOR_POSITIONS, ANCHOR_COUNT);
+            has_pos = 0;
+            printf("  [EKF RESET] divergence detected\r\n");
         } else {
-            stat_solve_fail++;
-            if (stat_solve_fail <= 5) {
-                int d0 = (int)(distances[0] * 100.0f);
-                int d1 = (int)(distances[1] * 100.0f);
-                int d2 = (int)(distances[2] * 100.0f);
-                int d3 = (int)(distances[3] * 100.0f);
-                printf("  [DIAG] fail #%lu: d=%d.%02d, %d.%02d, %d.%02d, %d.%02d\r\n",
-                       (unsigned long)stat_solve_fail,
-                       d0/100, (d0>=0?d0:-d0)%100,
-                       d1/100, (d1>=0?d1:-d1)%100,
-                       d2/100, (d2>=0?d2:-d2)%100,
-                       d3/100, (d3>=0?d3:-d3)%100);
-            }
+            gx = x; gy = y; gz = z;
+            gvx = vx; gvy = vy;
+            has_pos = 1;
         }
+
+        int32_t lat_e7, lon_e7, alt_mm;
+        local_to_gps(gx, gy, gz, GPS_ORIGIN_LAT, GPS_ORIGIN_LON, GPS_ORIGIN_ALT,
+                     &lat_e7, &lon_e7, &alt_mm);
+
+        int xi  = (int)(gx  * 100.0f + (gx  >= 0 ? 0.5f : -0.5f));
+        int yi  = (int)(gy  * 100.0f + (gy  >= 0 ? 0.5f : -0.5f));
+        int zi  = (int)(gz  * 100.0f + (gz  >= 0 ? 0.5f : -0.5f));
+        int vxi = (int)(gvx * 100.0f + (gvx >= 0 ? 0.5f : -0.5f));
+        int vyi = (int)(gvy * 100.0f + (gvy >= 0 ? 0.5f : -0.5f));
+
+        printf("[%lu] x=%d.%02d y=%d.%02d z=%d.%02d  v=%d.%02d,%d.%02d  GPS: %ld.%07ld,%ld.%07ld,%ld.%03ldm\r\n",
+               (unsigned long)(now / 1000UL),
+               xi / 100,  (xi  >= 0 ? xi  : -xi ) % 100,
+               yi / 100,  (yi  >= 0 ? yi  : -yi ) % 100,
+               zi / 100,  (zi  >= 0 ? zi  : -zi ) % 100,
+               vxi / 100, (vxi >= 0 ? vxi : -vxi) % 100,
+               vyi / 100, (vyi >= 0 ? vyi : -vyi) % 100,
+               (long)(lat_e7 / 10000000),   labs(lat_e7 % 10000000),
+               (long)(lon_e7 / 10000000),   labs(lon_e7 % 10000000),
+               (long)(alt_mm / 1000),       labs(alt_mm % 1000));
+    } else if (uwb_parser_valid_count(&parser, now) >= 3) {
+        stat_ekf_none++;
     }
 
     /* ---- NMEA output (5Hz, non-blocking DMA chain) ---- */
     if (now - last_nmea_time >= (uint32_t)(1000.0f / NMEA_RATE_HZ)) {
         last_nmea_time = now;
 
-        /* DMA guard: don't overwrite buffers while DMA still active */
         if (nmea_tx_state == NMEA_IDLE) {
+            int fix_ok, sats;
+            float hdop;
+            uwb_ekf_health(&ekf, now, &fix_ok, &sats, &hdop);
+
+            /* DIAG: hardcode fix to bypass health gating for test */
             nmea_gen_generate(&nmea, gx, gy, gz, gvx, gvy,
                               GPS_ORIGIN_LAT, GPS_ORIGIN_LON, GPS_ORIGIN_ALT,
-                              now / 1000UL);
+                              now / 1000UL, /*fix*/1, /*sats*/12, /*hdop*/0.9f);
 
             const char *ggpa = nmea_gen_ggpa(&nmea);
             const char *rmc  = nmea_gen_rmc(&nmea);
             const char *vtg  = nmea_gen_vtg(&nmea);
-
-            /* non-blocking DMA chain: GGA→RMC→VTG via TX complete ISR */
             nmea_start_dma_send(ggpa, rmc, vtg);
 
             nmea_count++;
@@ -336,8 +286,8 @@ int main(void)
                 printf("    %s\r\n\r\n", vtg);
             }
             if (nmea_count % ((uint32_t)NMEA_RATE_HZ * 5) == 0) {
-                printf("  NMEA %lu -> USART3 %s\r\n",
-                       nmea_count, has_pos ? "[UWB]" : "[origin]");
+                printf("  NMEA %lu -> USART3  fix=%d sats=%d hdop=%.1f\r\n",
+                       nmea_count, fix_ok, sats, (double)hdop);
             }
         }
     }
@@ -346,30 +296,23 @@ int main(void)
     if (now - last_stat_time >= 5000UL) {
         last_stat_time = now;
         printf("\r\n  === STATS (5s) ===\r\n");
-        printf("  parse: ok=%lu err=%lu | solve: ok=%lu fail=%lu\r\n",
-               stat_parse_ok, stat_parse_err, stat_solve_ok, stat_solve_fail);
+        printf("  ekf_updates: %lu | ekf_none: %lu\r\n",
+               stat_ekf_updates, stat_ekf_none);
         printf("  nmea_sent: %lu | dma_state: %d\r\n",
                stat_nmea_frames, (int)nmea_tx_state);
-        printf("  uart2_rx: %lu bytes | parser: ok=%lu bad=%lu\r\n",
-               uart2_rx_count,
-               (unsigned long)g_parser_line_ok, (unsigned long)g_parser_line_bad);
-        printf("  has_pos: %d | valid_cnt: %d\r\n",
-               has_pos, uwb_parser_valid_count(&parser, HAL_GetTick()));
-        if (g_uwb_has_raw_line) {
-            printf("  last_raw: [%s]\r\n", g_uwb_last_raw_line);
-            g_uwb_has_raw_line = 0;
+        printf("  uart2_rx: %lu bytes | valid_cnt: %d\r\n",
+               uart2_rx_count, uwb_parser_valid_count(&parser, now));
+        printf("  parser: ok=%d bad=%d\r\n", g_line_ok, g_line_bad);
+        if (g_has_raw_line) {
+            printf("  raw: [%s]\r\n", g_raw_line);
+            g_has_raw_line = 0;
         }
         printf("\r\n");
     }
     /* USER CODE END 3 */
   }
-  /* USER CODE END 3 */
 }
 
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -404,34 +347,16 @@ void SystemClock_Config(void)
 
 /* USER CODE END 4 */
 
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
-  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

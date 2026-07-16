@@ -73,9 +73,9 @@ static void e7_to_nmea(int32_t deg_e7, int deg_width,
     if (min_int   >= 60)      { min_int   -= 60;       deg_int++; }
 
     if (deg_width == 3)
-        snprintf(out, 24, "%03d%02d.%06d,%c", deg_int, min_int, min_frac6, dir);
+        snprintf(out, 24, "%03d%02d.%06d,%c", (int)deg_int, (int)min_int, (int)min_frac6, dir);
     else
-        snprintf(out, 24, "%02d%02d.%06d,%c", deg_int, min_int, min_frac6, dir);
+        snprintf(out, 24, "%02d%02d.%06d,%c", (int)deg_int, (int)min_int, (int)min_frac6, dir);
 }
 
 static void deg_to_nmea_lat(int32_t lat_e7, char *out) {
@@ -169,7 +169,14 @@ void nmea_gen_generate(struct NMEA_Generator *n,
                        float x, float y, float z,
                        float vx, float vy,
                        int32_t origin_lat, int32_t origin_lon, int32_t origin_alt,
-                       uint32_t now_sec) {
+                       uint32_t now_sec,
+                       int fix_quality, int sats, float hdop) {
+    /* fix_quality: 0=无效(失锁), 1=有效。sats/hdop 由 EKF 健康度实时给出，
+     * 失锁时如实反映，避免地面站把冻结/发散的位置当成健康 GPS。 */
+    if (fix_quality < 0) fix_quality = 0;
+    if (sats < 0) sats = 0;
+    if (hdop < 0.1f) hdop = 0.1f;
+    char status = (fix_quality > 0) ? 'A' : 'V';
     /* Step 1: UWB → GPS (E7) */
     int32_t lat_e7, lon_e7, alt_mm;
     local_to_gps(x, y, z, origin_lat, origin_lon, origin_alt, &lat_e7, &lon_e7, &alt_mm);
@@ -205,7 +212,7 @@ void nmea_gen_generate(struct NMEA_Generator *n,
     char alt_str[12], hdop_str[12];
     char spd_str[12], crs_str[12], spdkm_str[12];
     fmt_1dp(alt_str,  alt_m);
-    fmt_1dp(hdop_str, NMEA_HDOP);
+    fmt_2dp(hdop_str, hdop);
     fmt_2dp(spd_str,  speed_kn);
     fmt_1dp(crs_str,  course);
     fmt_2dp(spdkm_str, speed_kmh);
@@ -213,15 +220,16 @@ void nmea_gen_generate(struct NMEA_Generator *n,
     /* Step 6: $GPGGA — GPS Fix Data
      * Format: time,lat,N,lon,E,quality,sats,hdop,alt,M,geoid,M,age,refid */
     snprintf(n->ggpa, sizeof(n->ggpa),
-             "$GPGGA,%s.00,%s,%s,1,%02d,%s,%s,M,0.0,M,,*",
-             time_str, lat_str, lon_str, NMEA_SATELLITES, hdop_str, alt_str);
+             "$GPGGA,%s.00,%s,%s,%d,%02d,%s,%s,M,0.0,M,,*",
+             time_str, lat_str, lon_str, fix_quality, sats, hdop_str, alt_str);
     nmea_checksum_append(n->ggpa);
 
     /* Step 7: $GPRMC — Recommended Minimum Navigation Information
      * Format: time,status,lat,N,lon,E,speed,course,date,magvar,magdir,mode */
     snprintf(n->rmc, sizeof(n->rmc),
-             "$GPRMC,%s.00,A,%s,%s,%s,%s,%s,0.0,E,A*",
-             time_str, lat_str, lon_str, spd_str, crs_str, date_str);
+             "$GPRMC,%s.00,%c,%s,%s,%s,%s,%s,0.0,E,%c*",
+             time_str, status, lat_str, lon_str, spd_str, crs_str, date_str,
+             (fix_quality > 0) ? 'A' : 'N');
     nmea_checksum_append(n->rmc);
 
     /* Step 8: $GPVTG — Course Over Ground and Ground Speed

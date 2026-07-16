@@ -1,0 +1,6 @@
+../Core/Src/uwb_ekf.c:26:6:uwb_ekf_init	48	static
+../Core/Src/uwb_ekf.c:53:13:ekf_predict	88	static
+../Core/Src/uwb_ekf.c:91:12:ekf_update_range	184	static
+../Core/Src/uwb_ekf.c:139:5:uwb_ekf_step	104	static
+../Core/Src/uwb_ekf.c:195:6:uwb_ekf_get	40	static
+../Core/Src/uwb_ekf.c:208:6:uwb_ekf_health	56	static

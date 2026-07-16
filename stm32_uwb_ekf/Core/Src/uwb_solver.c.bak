@@ -157,6 +157,7 @@ void dist_filter_apply(struct DistanceFilter *df, float raw[], int count) {
             df->window[df->window_count][i] = raw[i];
         }
         df->window_count++;
+        if (df->window_count < 3) return;
     } else {
         /* shift left, drop oldest */
         for (int w = 0; w < DIST_WINDOW_SIZE - 1; w++) {
@@ -291,8 +292,7 @@ void uwb_solver_init(struct UWBSolver *s, const float anchors[][3], int count) {
     s->last_x = s->last_y = s->last_z = 0.0f;
     s->last_raw_x = s->last_raw_y = s->last_raw_z = 0.0f;
     s->has_last_pos = 0;
-    s->has_smooth_pos = 0;
-    s->last_solve_mode = 0;
+    s->has_ab_state = 0;
     pos_filter_init(&s->pos_filter);
 }
 
@@ -468,27 +468,11 @@ int uwb_solver_solve(struct UWBSolver *s, const float distances[],
     float prev_rx = s->last_raw_x, prev_ry = s->last_raw_y, prev_rz = s->last_raw_z;
     int had_prev = s->has_last_pos;
 
-    /* trilateration with hysteresis — prevent 2D/3D ping-pong */
-    int prefer_2d = 0;
-    if (s->last_solve_mode == 2) {
-        prefer_2d = (valid_cnt < 4);   /* stay 2D unless 4+ anchors */
-    } else {
-        prefer_2d = (valid_cnt < 3);   /* stay 3D unless <3 anchors (shouldn't happen) */
-    }
-    if (valid_cnt == 3 && s->last_solve_mode == 0)
-        prefer_2d = 1;                  /* first time with 3 anchors: use 2D */
-
-    if (prefer_2d && valid_cnt >= 3) {
+    /* trilateration */
+    if (valid_cnt == 3) {
         if (!solve_2d(s, valid_idx, distances, x, y, z)) return 0;
-        s->last_solve_mode = 2;
-    } else if (valid_cnt >= 4) {
+    } else {
         if (!solve_3d(s, valid_idx, distances, valid_cnt, x, y, z)) return 0;
-        s->last_solve_mode = 3;
-    } else if (valid_cnt == 3) {
-        if (!solve_2d(s, valid_idx, distances, x, y, z)) return 0;
-        s->last_solve_mode = 2;
-    } else {
-        return 0;
     }
 
     /* NaN/Inf guard — prevent contamination of filters.
@@ -510,18 +494,40 @@ int uwb_solver_solve(struct UWBSolver *s, const float distances[],
         *vx = *vy = *vz = 0.0f;
     }
 
-    /* position EMA (skip median — POS_WINDOW_SIZE=1 = passthrough) */
-    if (!s->has_smooth_pos) {
-        s->smooth_x = *x; s->smooth_y = *y; s->smooth_z = *z;
-        s->has_smooth_pos = 1;
+    /* position median filter (remove outliers) */
+    pos_filter_apply(&s->pos_filter, x, y, z);
+
+    /* α-β filter: predict with velocity, correct with measurement
+       x̅ = x̂₋₁ + v̂₋₁·dt      (prediction)
+       r  = z - x̅              (residual)
+       x̂ = x̅ + α·r            (position update)
+       v̂ = v̂₋₁ + (β/dt)·r     (velocity update) */
+    if (!s->has_ab_state) {
+        s->ax_x = *x;  s->ay_y = *y;  s->az_z = *z;
+        s->ax_vx = *vx; s->ay_vy = *vy; s->az_vz = *vz;
+        s->has_ab_state = 1;
     } else {
-        s->smooth_x += POS_ALPHA * (*x - s->smooth_x);
-        s->smooth_y += POS_ALPHA * (*y - s->smooth_y);
-        s->smooth_z += POS_ALPHA * (*z - s->smooth_z);
+        /* predict */
+        float px = s->ax_x + s->ax_vx * dt;
+        float py = s->ay_y + s->ay_vy * dt;
+        float pz = s->az_z + s->az_vz * dt;
+
+        /* residual */
+        float rx = *x - px;
+        float ry = *y - py;
+        float rz = *z - pz;
+
+        /* update */
+        s->ax_x   += POS_ALPHA * rx;
+        s->ay_y   += POS_ALPHA * ry;
+        s->az_z   += POS_ALPHA * rz;
+        s->ax_vx  += (POS_BETA / dt) * rx;
+        s->ay_vy  += (POS_BETA / dt) * ry;
+        s->az_vz  += (POS_BETA / dt) * rz;
     }
-    *x = s->smooth_x;
-    *y = s->smooth_y;
-    *z = s->smooth_z;
+    *x = s->ax_x;
+    *y = s->ay_y;
+    *z = s->az_z;
 
     /* store filtered position */
     s->last_x = *x; s->last_y = *y; s->last_z = *z;

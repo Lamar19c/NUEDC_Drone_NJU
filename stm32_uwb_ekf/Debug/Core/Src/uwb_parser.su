@@ -1,0 +1,5 @@
+../Core/Src/uwb_parser.c:13:6:uwb_parser_init	24	static
+../Core/Src/uwb_parser.c:26:12:uwb_parser_parse_line	48	static
+../Core/Src/uwb_parser.c:72:5:uwb_parser_feed	24	static
+../Core/Src/uwb_parser.c:87:5:uwb_parser_valid_count	24	static
+../Core/Src/uwb_parser.c:98:5:uwb_parser_get_valid_distances	32	static

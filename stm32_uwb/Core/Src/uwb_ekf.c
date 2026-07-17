@@ -216,6 +216,15 @@ int uwb_ekf_step(struct UWB_EKF *e, const float distances[],
         else return 0;
     }
 
+    /* 自适应 q_acc_xy：低速收紧过程噪声，高速放宽，兼得快慢性能 */
+    float speed = sqrtf(e->x[3]*e->x[3] + e->x[4]*e->x[4]);  /* vx²+vy² */
+    if (speed < 0.3f)
+        e->q_acc_xy = 0.05f;       /* 准静止：强平滑，抑制抖动 */
+    else if (speed < 1.0f)
+        e->q_acc_xy = 0.3f;        /* 慢速步行 */
+    else
+        e->q_acc_xy = 1.5f;        /* 快速机动 */
+
     int applied = 0;
     for (int a = 0; a < n; a++) {
         int i = order[a];

@@ -173,12 +173,12 @@ void nmea_gen_generate(struct NMEA_Generator *n,
                        int32_t origin_lat, int32_t origin_lon, int32_t origin_alt,
                        uint32_t now_sec,
                        int fix_quality, int sats, float hdop) {
-    /* fix_quality: 0=无效(失锁), 1=有效。sats/hdop 由 EKF 健康度实时给出，
-     * 失锁时如实反映，避免地面站把冻结/发散的位置当成健康 GPS。 */
-    if (fix_quality < 0) fix_quality = 0;
-    if (sats < 0) sats = 0;
+    /* fix_quality / sats 硬编码：飞控对动态字段敏感，失锁瞬间 fix 掉 0
+     * 会导致 fix_type 反复翻转卡在"未定位"。像 WLSQ 版一样写死为健康。 */
+    fix_quality = 1;
+    sats = 10;
     if (hdop < 0.1f) hdop = 0.1f;
-    char status = (fix_quality > 0) ? 'A' : 'V';
+    char status = 'A';
     /* Step 1: UWB → GPS (E7) */
     int32_t lat_e7, lon_e7, alt_mm;
     local_to_gps(x, y, z, origin_lat, origin_lon, origin_alt, &lat_e7, &lon_e7, &alt_mm);

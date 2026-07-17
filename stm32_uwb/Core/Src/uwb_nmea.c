@@ -67,17 +67,17 @@ static void e7_to_nmea(int32_t deg_e7, int deg_width,
     int32_t min_int     = (int32_t)(min_e7 / 10000000);   /* 整分 0..59 */
     int64_t min_frac_e7 = min_e7 % 10000000;              /* 小数分 * 1e7 */
 
-    /* 取 5 位小数分 (小数分 * 1e5)，四舍五入。与真实 GPS 模块一致；
-     * 5 位≈1.85cm 已细于 UWB 噪声，第6位纯噪声无意义。部分飞控 NMEA
-     * 解析对小数位数有隐含假设，5 位更保险。 */
-    int32_t min_frac5 = (int32_t)((min_frac_e7 + 50) / 100);  /* 0..100000 */
-    if (min_frac5 >= 100000) { min_frac5 -= 100000; min_int++; }
-    if (min_int   >= 60)     { min_int   -= 60;      deg_int++; }
+    /* 取 4 位小数分 (小数分 * 1e4)，四舍五入。
+     * 4 位≈18.5cm 是 ArduPilot fix_type=3 的必要条件；
+     * 5 位/6 位会导致飞控 NMEA 解析失败 → fix_type=1。 */
+    int32_t min_frac4 = (int32_t)((min_frac_e7 + 500) / 1000);  /* 0..10000 */
+    if (min_frac4 >= 10000) { min_frac4 -= 10000; min_int++; }
+    if (min_int   >= 60)    { min_int   -= 60;     deg_int++; }
 
     if (deg_width == 3)
-        snprintf(out, 24, "%03d%02d.%05d,%c", deg_int, min_int, min_frac5, dir);
+        snprintf(out, 24, "%03d%02d.%04d,%c", deg_int, min_int, min_frac4, dir);
     else
-        snprintf(out, 24, "%02d%02d.%05d,%c", deg_int, min_int, min_frac5, dir);
+        snprintf(out, 24, "%02d%02d.%04d,%c", deg_int, min_int, min_frac4, dir);
 }
 
 static void deg_to_nmea_lat(int32_t lat_e7, char *out) {

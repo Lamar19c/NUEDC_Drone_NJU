@@ -67,9 +67,9 @@ static void e7_to_nmea(int32_t deg_e7, int deg_width,
     int32_t min_int     = (int32_t)(min_e7 / 10000000);   /* 整分 0..59 */
     int64_t min_frac_e7 = min_e7 % 10000000;              /* 小数分 * 1e7 */
 
-    /* 取 4 位小数分 (小数分 * 1e4)，四舍五入。经实测该飞控的 NMEA 解析
-     * 只吃 4 位小数分，5/6 位会解析失败导致整条 GGA 被丢、显示未定位。
-     * 4 位≈18.5cm 栅格，作为飞控水平定位输入，会被其 EKF 进一步平滑。 */
+    /* 取 4 位小数分 (小数分 * 1e4)，四舍五入。
+     * ArduPilot NMEA 解析要求 4 位小数分 (ddmm.mmmm)；
+     * 5 位/6 位会导致 fix_type=1 (NO_FIX)。 */
     int32_t min_frac4 = (int32_t)((min_frac_e7 + 500) / 1000);  /* 0..10000 */
     if (min_frac4 >= 10000) { min_frac4 -= 10000; min_int++; }
     if (min_int   >= 60)    { min_int   -= 60;     deg_int++; }
@@ -173,12 +173,23 @@ void nmea_gen_generate(struct NMEA_Generator *n,
                        int32_t origin_lat, int32_t origin_lon, int32_t origin_alt,
                        uint32_t now_sec,
                        int fix_quality, int sats, float hdop) {
-    /* fix_quality: 0=无效(失锁), 1=有效。sats/hdop 由 EKF 健康度实时给出，
-     * 失锁时如实反映，避免地面站把冻结/发散的位置当成健康 GPS。 */
-    if (fix_quality < 0) fix_quality = 0;
-    if (sats < 0) sats = 0;
+    /* fix_quality / sats 硬编码：飞控对动态字段敏感，失锁瞬间 fix 掉 0
+     * 会导致 fix_type 反复翻转卡在"未定位"。像 WLSQ 版一样写死为健康。 */
+    fix_quality = 1;
+    sats = 10;
     if (hdop < 0.1f) hdop = 0.1f;
-    char status = (fix_quality > 0) ? 'A' : 'V';
+    char status = 'A';
+
+    /* 坐标框架旋转：UWB Y轴指向 HEADING_OFFSET_DEG，X轴指向 HEADING_OFFSET_DEG+90°
+     * 将 UWB 系 (x,y) 旋转到真北-东坐标系后再转 GPS。速度也同步旋转。 */
+    float sin_h = sinf(HEADING_OFFSET_DEG * DEG_TO_RAD);
+    float cos_h = cosf(HEADING_OFFSET_DEG * DEG_TO_RAD);
+    float x_en =  x * cos_h + y * sin_h;   /* true east  */
+    float y_en = -x * sin_h + y * cos_h;   /* true north */
+    float vx_en =  vx * cos_h + vy * sin_h;
+    float vy_en = -vx * sin_h + vy * cos_h;
+    x = x_en; y = y_en; vx = vx_en; vy = vy_en;
+
     /* Step 1: UWB → GPS (E7) */
     int32_t lat_e7, lon_e7, alt_mm;
     local_to_gps(x, y, z, origin_lat, origin_lon, origin_alt, &lat_e7, &lon_e7, &alt_mm);
@@ -206,7 +217,7 @@ void nmea_gen_generate(struct NMEA_Generator *n,
     /* Step 5: Speed + course */
     float speed_kn = sqrtf(vx * vx + vy * vy) * 1.94384f;
     float speed_kmh = speed_kn * 1.852f;
-    float course = atan2f(vx, vy) * RAD_TO_DEG;
+    float course = atan2f(vx, vy) * RAD_TO_DEG;  /* vx,vy already rotated to true EN */
     if (course < 0.0f) course += 360.0f;
 
     /* Format float values with integer method */

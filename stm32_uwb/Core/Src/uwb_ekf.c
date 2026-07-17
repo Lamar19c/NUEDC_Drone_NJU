@@ -52,12 +52,12 @@
 #define EKF_Q_ACC_Z_DEFAULT       0.5f    /* 垂直几何差，压小 */
 #define EKF_R_RANGE_DEFAULT       0.04f   /* σ_range≈0.2m -> 0.04 m^2 */
 #define EKF_GATE_SQ_DEFAULT       36.0f   /* 6σ 门限，放宽避免初始收敛时拒测 */
-#define EKF_HDOP_REF_SIGMA        0.80f   /* HDOP=σ_pos/0.80m，对齐 ArduPilot GPS_HDOP_GOOD=1.4 */
+#define EKF_HDOP_REF_SIGMA        1.00f   /* HDOP=σ_pos/1.0m，收敛后<1，对齐 GPS_HDOP_GOOD=1.4 */
 #define EKF_MEAS_TIMEOUT_MS       200u
 #define EKF_FIX_TIMEOUT_MS        300u
 #define EKF_HEALTH_ANCHOR_MS      300u    /* 判"近期在线锚点"的窗口 */
 #define EKF_POS_SIGMA_MAX         1.5f    /* 水平 σ 超过则判 fix 不可信 */
-#define EKF_INIT_POS_VAR          4.0f    /* 初始位置方差 (2m)^2，降低冷启动协方差 */
+#define EKF_INIT_POS_VAR          1.0f    /* 初始位置方差 (1m)^2，冷启动HDOP≈1.4 */
 #define EKF_INIT_VEL_VAR          4.0f    /* 初始速度方差 (2m/s)^2 */
 
 void uwb_ekf_init(struct UWB_EKF *e, const float anchors[][3], int count) {

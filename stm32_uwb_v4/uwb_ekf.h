@@ -42,9 +42,20 @@ struct UWB_EKF {
     uint32_t last_good_update_ms;
     int      consec_reject;
     int      last_step_anchor_cnt;
+
+    /* 固定高度模式：z 不由测距估计(垂直几何差、几乎不可观测)，
+     * 改由外部(气压计/测距仪/常值)给定。启用后 x/y 仍正常估计。 */
+    int   z_fixed;
+    float z_ext;
 };
 
 void uwb_ekf_init(struct UWB_EKF *e, const float anchors[][3], int count);
+
+/* 启用固定高度模式并设定初始高度 (强烈建议本布站使用) */
+void uwb_ekf_set_fixed_z(struct UWB_EKF *e, float z);
+
+/* 固定高度模式下，每周期用外部高度源(气压计/测距仪)刷新 z */
+void uwb_ekf_update_height(struct UWB_EKF *e, float z);
 
 /**
  * 喂入当前每锚点的距离快照 + 各自时间戳。函数内部只消费"比上次更新"的
@@ -63,5 +74,8 @@ void uwb_ekf_get(struct UWB_EKF *e, uint32_t now_ms,
 /* 供 NMEA 使用的健康度：fix_ok(0/1)、伪卫星数、HDOP */
 void uwb_ekf_health(const struct UWB_EKF *e, uint32_t now_ms,
                     int *fix_ok, int *sats, float *hdop);
+
+/* 当前在线锚点数(近期有测量的锚点)，供调试打印观察健康度 */
+int  uwb_ekf_online_anchors(const struct UWB_EKF *e, uint32_t now_ms);
 
 #endif /* UWB_EKF_H */

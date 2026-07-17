@@ -7431,7 +7431,7 @@ void nmea_gen_generate(struct NMEA_Generator *n,
  8003dc0:	461a      	mov	r2, r3
  8003dc2:	e000      	b.n	8003dc6 <nmea_gen_generate+0x13a>
  8003dc4:	2200      	movs	r2, #0
- 8003dc6:	2336      	movs	r3, #54	@ 0x36
+ 8003dc6:	2337      	movs	r3, #55	@ 0x37
  8003dc8:	3b30      	subs	r3, #48	@ 0x30
  8003dca:	4413      	add	r3, r2
  8003dcc:	f8c7 30bc 	str.w	r3, [r7, #188]	@ 0xbc

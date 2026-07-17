@@ -1,6 +1,42 @@
 /**
  * uwb_ekf.c — 常速模型 EKF，测距逐锚点顺序更新 (实现)
  *
+ * ============================ 现场标定清单 ============================
+ * 上机时按顺序调这几个量，均在下方 "默认调参" 宏定义处修改。
+ *
+ * 1. 固定高度 FIXED_HEIGHT_M (在 main.c)
+ *    量一下 tag 实际离地高度，填进去。本布站锚点垂直几乎共面，z 不可观测，
+ *    必须固定。高度偏 0.5m 只带来 xy 2~5cm 误差，不必很精确。
+ *
+ * 2. r_range (测距量测方差, m^2) = σ_range^2
+ *    让 tag 静止，读串口 raw_d，估四个距离各自的标准差 σ。
+ *    典型 DW1000 LOS 下 σ≈0.05~0.10m，则 r_range 填 0.0025~0.01。
+ *    偏大 -> 轨迹发钝/滞后；偏小 -> 抖、易被野值带偏。
+ *
+ * 3. q_acc_xy (水平加速度过程噪声 PSD, m^2/s^3)
+ *    按预期最大机动定。手持慢走 2~4；无人机常规机动 8~16;
+ *    激进飞行/急转 20~40。偏小 -> 快速运动时轨迹滞后甚至被门限拒；
+ *    偏大 -> 静止时更抖。先 8 起步，看快速移动跟不跟得上再加。
+ *
+ * 4. gate_sq (innovation 卡方门限, 无量纲)
+ *    9≈3σ, 16≈4σ, 36≈6σ。NLOS/多径严重的场地调大(放宽)避免误拒好点;
+ *    但太大则野值进得来。默认 16。若串口频繁看到 fix 掉、anc 数偏低，
+ *    多半是门限太严把测量拒了，先放到 36 试。
+ *
+ * 5. hdop_ref_sigma (HDOP 归一化参考 σ, m)
+ *    只影响报给飞控的 HDOP 数值大小，不影响定位。收敛后串口看 hdop,
+ *    调这个让健康 HDOP 落到明显低于 ArduPilot GPS_HDOP_GOOD(默认1.4)、
+ *    留出裕度(如 0.7~0.9)。默认 0.15。
+ *
+ * 6. meas_timeout_ms / fix_timeout_ms
+ *    meas_timeout 略大于一个测距轮询周期(本系统约100ms)即可，默认200。
+ *    fix_timeout 是多久没有效更新就判失锁，默认300ms。
+ *
+ * 上机自检：串口每帧会打印 fix/hdop/anc(见 main.c)。正常应是
+ * fix=1、anc=4、hdop 稳定在小值；遮挡一个锚点 anc 掉到 3 仍 fix=1、
+ * hdop 略升；遮挡到 <3 或全遮，应在 300ms 内 fix=0、hdop 飙升。
+ * ====================================================================
+ *
  * CPU 预算 (F103@72MHz, soft-float 粗估):
  *   predict 利用 CV 结构 ~ 数百次浮点乘；每锚点标量 update ~ 百余次。
  *   每 20ms tick 最多 4 条更新，合计约 1~2k 次浮点运算，占用个位数百分比 CPU。
@@ -49,6 +85,23 @@ void uwb_ekf_init(struct UWB_EKF *e, const float anchors[][3], int count) {
     e->last_pred_ms = 0;
 }
 
+void uwb_ekf_set_fixed_z(struct UWB_EKF *e, float z) {
+    e->z_fixed = 1;
+    e->z_ext   = z;
+    e->x[2]    = z;
+    e->x[5]    = 0.0f;
+    e->q_acc_z = 0.0f;              /* z 不再有过程噪声 */
+    /* 断开 z、vz 与其它状态的协方差耦合，防止泄漏 */
+    for (int j = 0; j < 6; j++) {
+        e->P[2][j] = e->P[j][2] = 0.0f;
+        e->P[5][j] = e->P[j][5] = 0.0f;
+    }
+}
+
+void uwb_ekf_update_height(struct UWB_EKF *e, float z) {
+    if (e->z_fixed) { e->z_ext = z; e->x[2] = z; e->x[5] = 0.0f; }
+}
+
 /* ---- 预测：常速模型，P = F P F^T + Q，利用 F=[[I,dtI],[0,I]] 结构 ---- */
 static void ekf_predict(struct UWB_EKF *e, float dt) {
     if (dt <= 0.0f) return;
@@ -89,13 +142,15 @@ static void ekf_predict(struct UWB_EKF *e, float dt) {
 /* ---- 标量量测更新：单锚点距离 ----
  * 返回 1 = 已应用, 0 = 被门限剔除 */
 static int ekf_update_range(struct UWB_EKF *e, int ai, float meas) {
+    float zc = e->z_fixed ? e->z_ext : e->x[2];   /* 固定模式用外部高度算残差 */
     float dx = e->x[0] - e->anchors[ai][0];
     float dy = e->x[1] - e->anchors[ai][1];
-    float dz = e->x[2] - e->anchors[ai][2];
+    float dz = zc      - e->anchors[ai][2];
     float r  = sqrtf(dx*dx + dy*dy + dz*dz);
     if (r < 1e-3f) return 0;          /* 退化，跳过 */
 
-    float Hx = dx / r, Hy = dy / r, Hz = dz / r;   /* H 仅前三项非零 */
+    float Hx = dx / r, Hy = dy / r;
+    float Hz = e->z_fixed ? 0.0f : (dz / r);   /* 固定高度时不把残差摊到 z */
     float (*P)[6] = e->P;
 
     /* PHt (6x1) = P * H^T，H 只有前三列有效 */
@@ -114,10 +169,9 @@ static int ekf_update_range(struct UWB_EKF *e, int ai, float meas) {
     /* 增益 K = PHt / S，状态修正 */
     float invS = 1.0f / S;
     float K[6];
-    for (int i = 0; i < 6; i++) {
-        K[i] = PHt[i] * invS;
-        e->x[i] += K[i] * innov;
-    }
+    for (int i = 0; i < 6; i++) K[i] = PHt[i] * invS;
+    if (e->z_fixed) { K[2] = 0.0f; K[5] = 0.0f; }   /* 冻结 z、vz */
+    for (int i = 0; i < 6; i++) e->x[i] += K[i] * innov;
 
     /* P = (I - K H) P。HP (1x6) = H * P，H 只前三行 */
     float HP[6];
@@ -201,17 +255,23 @@ void uwb_ekf_get(struct UWB_EKF *e, uint32_t now_ms,
     if (dt > 0.5f) dt = 0.5f;
     *x = e->x[0] + e->x[3] * dt;
     *y = e->x[1] + e->x[4] * dt;
-    *z = e->x[2] + e->x[5] * dt;
-    *vx = e->x[3]; *vy = e->x[4]; *vz = e->x[5];
+    if (e->z_fixed) { *z = e->z_ext; *vz = 0.0f; }
+    else            { *z = e->x[2] + e->x[5] * dt; *vz = e->x[5]; }
+    *vx = e->x[3]; *vy = e->x[4];
+}
+
+int uwb_ekf_online_anchors(const struct UWB_EKF *e, uint32_t now_ms) {
+    int n = 0;
+    for (int i = 0; i < e->anchor_count && i < 8; i++)
+        if (e->last_meas_ms[i] != 0 &&
+            (now_ms - e->last_meas_ms[i]) < EKF_HEALTH_ANCHOR_MS)
+            n++;
+    return n;
 }
 
 void uwb_ekf_health(const struct UWB_EKF *e, uint32_t now_ms,
                     int *fix_ok, int *sats, float *hdop) {
-    int anchors_recent = 0;
-    for (int i = 0; i < e->anchor_count && i < 8; i++)
-        if (e->last_meas_ms[i] != 0 &&
-            (now_ms - e->last_meas_ms[i]) < EKF_HEALTH_ANCHOR_MS)
-            anchors_recent++;
+    int anchors_recent = uwb_ekf_online_anchors(e, now_ms);
 
     float pos_var = e->P[0][0] + e->P[1][1];
     float pos_sigma = (pos_var > 0.0f) ? sqrtf(pos_var) : 0.0f;

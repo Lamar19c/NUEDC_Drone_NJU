@@ -20,6 +20,7 @@ struct NMEA_Generator {
     char ggpa[100];
     char rmc[110];   /* GCC 估计最坏 103 字节，留余量 */
     char vtg[100];
+    char gsa[90];
 };
 
 void nmea_gen_init(struct NMEA_Generator *n);
@@ -28,11 +29,13 @@ void nmea_gen_generate(struct NMEA_Generator *n,
                        float x, float y, float z,
                        float vx, float vy,
                        int32_t origin_lat, int32_t origin_lon, int32_t origin_alt,
-                       uint32_t now_sec);
+                       uint32_t now_sec,
+                       int fix_quality, int sats, float hdop);
 
 const char* nmea_gen_ggpa(const struct NMEA_Generator *n);
 const char* nmea_gen_rmc(const struct NMEA_Generator *n);
 const char* nmea_gen_vtg(const struct NMEA_Generator *n);
+const char* nmea_gen_gsa(const struct NMEA_Generator *n);
 
 /* ========================================================================
  * local_to_gps — UWB 坐标 → GPS (E7)

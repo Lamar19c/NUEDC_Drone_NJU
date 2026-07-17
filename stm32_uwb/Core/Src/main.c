@@ -27,8 +27,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 #include "uwb_config.h"
-#include "uwb_solver.h"
+#include "uwb_solver.h"   /* 解析器 UWB_Parser 仍在此 */
+#include "uwb_ekf.h"
 #include "uwb_nmea.h"
 /* USER CODE END Includes */
 
@@ -65,13 +67,14 @@ static uint32_t uart2_rx_count = 0;     /* diagnostic: total bytes received */
 
 /* ---- global objects ---- */
 static struct UWB_Parser      parser;
-static struct DistanceFilter  dist_filt;
-static struct UWBSolver       solver;
+static struct UWB_EKF         ekf;
 static struct NMEA_Generator  nmea;
-static struct VelocityFilter  vel_filt;
+
+/* ---- 固定高度：UWB 只解水平，z 交给此常值(或下视测距仪) ---- */
+#define FIXED_HEIGHT_M  1.6f
 
 /* ---- position cache ---- */
-static float gx = 0.0f, gy = 0.0f, gz = 1.0f;
+static float gx = 0.0f, gy = 0.0f, gz = FIXED_HEIGHT_M;
 static float gvx = 0.0f, gvy = 0.0f;
 static int   has_pos = 0;
 
@@ -94,18 +97,23 @@ typedef enum {
     NMEA_IDLE = 0,
     NMEA_SENDING_GGPA,
     NMEA_SENDING_RMC,
-    NMEA_SENDING_VTG
+    NMEA_SENDING_VTG,
+    NMEA_SENDING_GSA
 } nmea_tx_state_t;
 
 static nmea_tx_state_t nmea_tx_state = NMEA_IDLE;
 static const char *nmea_tx_rmc_ptr  = NULL;  /* saved for chaining */
 static const char *nmea_tx_vtg_ptr  = NULL;
+static const char *nmea_tx_gsa_ptr  = NULL;
 
-/** Kick off NMEA DMA chain: GGA → RMC → VTG via TX complete callback. */
-static void nmea_start_dma_send(const char *ggpa, const char *rmc, const char *vtg) {
+/** Kick off NMEA DMA chain: GGA → RMC → VTG → GSA via TX complete callback.
+ *  GSA 携带定位类型(3=3D)，飞控靠它确认三维定位，缺了会卡在"未定位/二维"。 */
+static void nmea_start_dma_send(const char *ggpa, const char *rmc,
+                                const char *vtg, const char *gsa) {
     if (nmea_tx_state != NMEA_IDLE) return;  /* still sending previous batch */
     nmea_tx_rmc_ptr = rmc;
     nmea_tx_vtg_ptr = vtg;
+    nmea_tx_gsa_ptr = gsa;
     nmea_tx_state   = NMEA_SENDING_GGPA;
     HAL_UART_Transmit_DMA(&huart3, (uint8_t *)ggpa, (uint16_t)strlen(ggpa));
 }
@@ -134,6 +142,11 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
                                   (uint16_t)strlen(nmea_tx_vtg_ptr));
             break;
         case NMEA_SENDING_VTG:
+            nmea_tx_state = NMEA_SENDING_GSA;
+            HAL_UART_Transmit_DMA(&huart3, (uint8_t *)nmea_tx_gsa_ptr,
+                                  (uint16_t)strlen(nmea_tx_gsa_ptr));
+            break;
+        case NMEA_SENDING_GSA:
             nmea_tx_state = NMEA_IDLE;
             break;
         default:
@@ -205,9 +218,8 @@ int main(void)
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   uwb_parser_init(&parser);
-  dist_filter_init(&dist_filt);
-  uwb_solver_init(&solver, ANCHOR_POSITIONS, ANCHOR_COUNT);
-  vel_filter_init(&vel_filt);
+  uwb_ekf_init(&ekf, ANCHOR_POSITIONS, ANCHOR_COUNT);
+  uwb_ekf_set_fixed_z(&ekf, FIXED_HEIGHT_M);   /* 固定高度模式 */
   nmea_gen_init(&nmea);
 
   HAL_UART_Receive_IT(&huart2, &rx2_char, 1);
@@ -215,7 +227,7 @@ int main(void)
 
   printf("\r\n========================================\r\n");
   printf("  UWB Indoor 3D Localization - STM32F103C8T6\r\n");
-  printf("  (dual median filter)\r\n");
+  printf("  (CV-EKF, sequential range update, fixed height)\r\n");
   printf("========================================\r\n");
   printf("Anchors: %d\r\n", ANCHOR_COUNT);
   for (int i = 0; i < ANCHOR_COUNT; i++) {
@@ -249,29 +261,36 @@ int main(void)
     if (now - last_loop_time < LOOP_INTERVAL_MS) continue;
     last_loop_time = now;
 
-    /* ---- UWB solve ---- */
+    /* ---- UWB solve (CV-EKF, 逐锚点时间戳顺序更新) ---- */
     if (uwb_parser_valid_count(&parser, now) >= 3) {
         float distances[ANCHOR_COUNT];
         int valid = uwb_parser_get_valid_distances(&parser, distances, ANCHOR_COUNT, now);
         if (valid == 0) stat_parse_err++; else stat_parse_ok++;
-        /* 距离由超时机制自动失效，不再主动清空 */
 
-        dist_filter_apply(&dist_filt, distances, ANCHOR_COUNT);
+        /* 原始距离直接喂 EKF：内部按各锚点时间戳升序做 predict+update，
+           从根本上消除顺序测距的时间偏斜；外点由 innovation 门限剔除，
+           不再做距离中值/EMA(那是滞后与"越快框越大"的来源)。 */
+        int applied = uwb_ekf_step(&ekf, distances, parser.last_update_ms, now);
 
         float x, y, z, vx, vy, vz;
-        if (uwb_solver_solve(&solver, distances, now,
-                             &x, &y, &z, &vx, &vy, &vz)) {
-            /* independent velocity low-pass filter (reduces phase lag) */
-            vel_filter_apply(&vel_filt, &vx, &vy, &vz);
+        uwb_ekf_get(&ekf, now, &x, &y, &z, &vx, &vy, &vz);
 
+        /* 发散防护：坏几何/soft-float 下万一出 NaN/Inf，复位重收敛，
+           绝不让乱码污染 NMEA(否则飞控会收到 nan 经纬度)。 */
+        if (isfinite(x) && isfinite(y) && isfinite(z)) {
             gx = x; gy = y; gz = z; gvx = vx; gvy = vy;
             has_pos = 1;
-            loop_count++;
-            stat_solve_ok++;
+            if (applied > 0) { loop_count++; stat_solve_ok++; }
 
             int32_t lat_e7, lon_e7, alt_mm;
             local_to_gps(x, y, z, GPS_ORIGIN_LAT, GPS_ORIGIN_LON, GPS_ORIGIN_ALT,
                          &lat_e7, &lon_e7, &alt_mm);
+
+            /* 健康度：逐帧观察 fix / hdop / 在线锚点数 */
+            int dbg_fix = 0, dbg_sats = 0; float dbg_hdop = 0.0f;
+            uwb_ekf_health(&ekf, now, &dbg_fix, &dbg_sats, &dbg_hdop);
+            int dbg_anc = uwb_ekf_online_anchors(&ekf, now);
+            int hdi = (int)(dbg_hdop * 100.0f + 0.5f);   /* 无 float printf，整数化 */
 
             int xi  = (int)(x  * 100.0f + (x  >= 0 ? 0.5f : -0.5f));
             int yi  = (int)(y  * 100.0f + (y  >= 0 ? 0.5f : -0.5f));
@@ -282,6 +301,7 @@ int main(void)
 
             printf("[%lu] x=%d.%02d y=%d.%02d z=%d.%02d  "
                    "vx=%d.%02d vy=%d.%02d vz=%d.%02d  "
+                   "fix=%d anc=%d hdop=%d.%02d  "
                    "GPS: %ld.%07ld,%ld.%07ld,%ld.%03ldm\r\n",
                    (unsigned long)(HAL_GetTick() / 1000UL),
                    xi / 100,  (xi  >= 0 ? xi  : -xi ) % 100,
@@ -290,23 +310,17 @@ int main(void)
                    vxi / 100, (vxi >= 0 ? vxi : -vxi) % 100,
                    vyi / 100, (vyi >= 0 ? vyi : -vyi) % 100,
                    vzi / 100, (vzi >= 0 ? vzi : -vzi) % 100,
+                   dbg_fix, dbg_anc, hdi / 100, (hdi >= 0 ? hdi : -hdi) % 100,
                    (long)(lat_e7 / 10000000),   labs(lat_e7 % 10000000),
                    (long)(lon_e7 / 10000000),   labs(lon_e7 % 10000000),
                    (long)(alt_mm / 1000),       labs(alt_mm % 1000));
         } else {
+            uwb_ekf_init(&ekf, ANCHOR_POSITIONS, ANCHOR_COUNT);
+            uwb_ekf_set_fixed_z(&ekf, FIXED_HEIGHT_M);   /* 复位重收敛 */
+            has_pos = 0;
             stat_solve_fail++;
-            if (stat_solve_fail <= 5) {
-                int d0 = (int)(distances[0] * 100.0f);
-                int d1 = (int)(distances[1] * 100.0f);
-                int d2 = (int)(distances[2] * 100.0f);
-                int d3 = (int)(distances[3] * 100.0f);
-                printf("  [DIAG] fail #%lu: d=%d.%02d, %d.%02d, %d.%02d, %d.%02d\r\n",
-                       (unsigned long)stat_solve_fail,
-                       d0/100, (d0>=0?d0:-d0)%100,
-                       d1/100, (d1>=0?d1:-d1)%100,
-                       d2/100, (d2>=0?d2:-d2)%100,
-                       d3/100, (d3>=0?d3:-d3)%100);
-            }
+            printf("  [DIAG] EKF diverged -> reset #%lu\r\n",
+                   (unsigned long)stat_solve_fail);
         }
     }
 
@@ -316,16 +330,23 @@ int main(void)
 
         /* DMA guard: don't overwrite buffers while DMA still active */
         if (nmea_tx_state == NMEA_IDLE) {
+            /* 健康度由 EKF 协方差/锚点新鲜度实时给出，失锁时如实反映，
+               避免飞控把冻结/发散的位置当成健康 GPS。 */
+            int fix_ok = 0, sats = 0; float hdop = 99.0f;
+            uwb_ekf_health(&ekf, now, &fix_ok, &sats, &hdop);
+            if (!has_pos) { fix_ok = 0; sats = 0; }   /* 首个有效解前不报锁 */
+
             nmea_gen_generate(&nmea, gx, gy, gz, gvx, gvy,
                               GPS_ORIGIN_LAT, GPS_ORIGIN_LON, GPS_ORIGIN_ALT,
-                              now / 1000UL);
+                              now / 1000UL, fix_ok, sats, hdop);
 
             const char *ggpa = nmea_gen_ggpa(&nmea);
             const char *rmc  = nmea_gen_rmc(&nmea);
             const char *vtg  = nmea_gen_vtg(&nmea);
+            const char *gsa  = nmea_gen_gsa(&nmea);
 
-            /* non-blocking DMA chain: GGA→RMC→VTG via TX complete ISR */
-            nmea_start_dma_send(ggpa, rmc, vtg);
+            /* non-blocking DMA chain: GGA→RMC→VTG→GSA via TX complete ISR */
+            nmea_start_dma_send(ggpa, rmc, vtg, gsa);
 
             nmea_count++;
             stat_nmea_frames++;
@@ -333,11 +354,11 @@ int main(void)
                 printf("\r\n  NMEA first sentences sent:\r\n");
                 printf("    %s", ggpa);
                 printf("    %s", rmc);
-                printf("    %s\r\n\r\n", vtg);
+                printf("    %s", vtg);
+                printf("    %s\r\n\r\n", gsa);
             }
             if (nmea_count % ((uint32_t)NMEA_RATE_HZ * 5) == 0) {
-                printf("  NMEA %lu -> USART3 %s\r\n",
-                       nmea_count, has_pos ? "[UWB]" : "[origin]");
+                printf("  TX GGA: %s", ggpa);   /* 看实际发出的定位质量位 */
             }
         }
     }

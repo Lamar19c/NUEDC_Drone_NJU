@@ -1,5 +1,11 @@
 /**
  * uwb_nmea.c — NMEA 0183 GPS 语句生成器 (实现)
+ *
+ * v4: int64 E7→NMEA 全整数路径 + 4位小数分 + GSA
+ *     - 坐标转换全程 int64，不经 float32（避免 E7→float 尾数截断）
+ *     - 4位小数分 (ddmm.mmmm) 经实测是 ArduPilot fix_type=3 的必要条件
+ *     - 5位/6位小数分在部分飞控 NMEA 解析中会导致 fix_type=1 (NO_FIX)
+ *     - GSA 携带定位类型(3=3D)，飞控靠它确认三维定位
  */
 #include "uwb_nmea.h"
 #include "uwb_config.h"
@@ -36,23 +42,19 @@ static int fmt_2dp(char *buf, float val) {
 }
 
 /* ========================================================================
- * 2. 坐标格式转换
+ * 2. 坐标格式转换 — int64 全整数路径
+ *
+ *    直接吃 int32 E7 经纬度，全程 int64 整数运算，绝不经过 float32。
+ *    旧版 (float)e7/1e7f 会把 ~3.2e8 / ~1.19e9 的 E7 值塞进 24 位尾数，
+ *    纬度 ULP ~0.42m、经度 ULP ~0.72m，直接吸附成矩形栅格。
+ *
+ *    分小数位 4 位 (0.0001')，量化步进 ~18.5cm。虽比 UWB 噪声粗，
+ *    但这是 ArduPilot NMEA 解析器能正确识别 fix_type=3 的格式。
+ *    5 位/6 位反而导致 fix_type=1 (NO_FIX)。
+ *
+ *    deg_width = 2 (纬度 ddmm.mmmm) 或 3 (经度 dddmm.mmmm)。
  * ======================================================================== */
 
-/*
- * v3 高精度坐标转换
- *
- * 直接吃 int32 E7 经纬度，全程 int64 整数运算，绝不经过 float32。
- * 旧版 (float)e7/1e7f 会把 ~3.2e8 / ~1.19e9 的 E7 值塞进 24 位尾数，
- * 纬度 ULP ~0.42m、经度 ULP ~0.72m，直接吸附成矩形栅格，是低速轨迹
- * 抖动/不准的主因之一。
- *
- * 分小数位由 4 位提到 6 位 (0.0001' -> 0.000001')，量化步进由 ~18cm
- * 降到 ~1.9mm，远小于 UWB 本身噪声。ArduPilot 的 NMEA 解析按位读取
- * 小数分，位数不限，6 位安全。
- *
- * deg_width = 2 (纬度 ddmm.mmmmmm) 或 3 (经度 dddmm.mmmmmm)。
- */
 static void e7_to_nmea(int32_t deg_e7, int deg_width,
                        char pos_dir, char neg_dir, char *out) {
     char    dir = (deg_e7 >= 0) ? pos_dir : neg_dir;
@@ -67,17 +69,17 @@ static void e7_to_nmea(int32_t deg_e7, int deg_width,
     int32_t min_int     = (int32_t)(min_e7 / 10000000);   /* 整分 0..59 */
     int64_t min_frac_e7 = min_e7 % 10000000;              /* 小数分 * 1e7 */
 
-    /* 取 5 位小数分 (小数分 * 1e5)，四舍五入。与真实 GPS 模块一致；
-     * 5 位≈1.85cm 已细于 UWB 噪声，第6位纯噪声无意义。部分飞控 NMEA
-     * 解析对小数位数有隐含假设，5 位更保险。 */
-    int32_t min_frac5 = (int32_t)((min_frac_e7 + 50) / 100);  /* 0..100000 */
-    if (min_frac5 >= 100000) { min_frac5 -= 100000; min_int++; }
-    if (min_int   >= 60)     { min_int   -= 60;      deg_int++; }
+    /* 取 4 位小数分 (小数分 * 1e4)，四舍五入。
+     * 4 位≈18.5cm 是 ArduPilot fix_type=3 的正确格式；
+     * 5 位/6 位会导致飞控 NMEA 解析失败 → fix_type=1。 */
+    int32_t min_frac4 = (int32_t)((min_frac_e7 + 500) / 1000);  /* 0..10000 */
+    if (min_frac4 >= 10000) { min_frac4 -= 10000; min_int++; }
+    if (min_int   >= 60)    { min_int   -= 60;     deg_int++; }
 
     if (deg_width == 3)
-        snprintf(out, 24, "%03d%02d.%05d,%c", deg_int, min_int, min_frac5, dir);
+        snprintf(out, 24, "%03d%02d.%04d,%c", deg_int, min_int, min_frac4, dir);
     else
-        snprintf(out, 24, "%02d%02d.%05d,%c", deg_int, min_int, min_frac5, dir);
+        snprintf(out, 24, "%02d%02d.%04d,%c", deg_int, min_int, min_frac4, dir);
 }
 
 static void deg_to_nmea_lat(int32_t lat_e7, char *out) {
@@ -124,8 +126,8 @@ static int month_num(const char *date_str) {
  *      Y → Latitude  (纬度, 南北方向)
  *      Z → Altitude  (海拔, 上下方向)
  *
- *    锚点布局 (v3): S1=(0,0,1.5) S2=(5,0,1.5) S3=(0,-5,0) S4=(5,5,1.5)
- *    S2 在 S1 正东 (X+), S3 在 S1 正南 (Y-)
+ *    锚点布局: S1=(0,0,1.0) S2=(5,0,1.5) S3=(0,5,1.5) S4=(5,5,1.0)
+ *    S2 在 S1 正东 (X+), S3 在 S1 正北 (Y+)
  *
  *    统一使用 POS_CLAMP_MIN/MAX 限幅
  * ======================================================================== */
@@ -165,6 +167,7 @@ void nmea_gen_init(struct NMEA_Generator *n) {
     n->ggpa[0] = '\0';
     n->rmc[0]  = '\0';
     n->vtg[0]  = '\0';
+    n->gsa[0]  = '\0';
 }
 
 void nmea_gen_generate(struct NMEA_Generator *n,
@@ -183,7 +186,7 @@ void nmea_gen_generate(struct NMEA_Generator *n,
     int32_t lat_e7, lon_e7, alt_mm;
     local_to_gps(x, y, z, origin_lat, origin_lon, origin_alt, &lat_e7, &lon_e7, &alt_mm);
 
-    /* Step 2: E7 → NMEA ddmm.mmmmmm (int64 全整数，不经 float32) */
+    /* Step 2: E7 → NMEA ddmm.mmmm (int64 全整数，不经 float32) */
     char lat_str[24], lon_str[24];
     deg_to_nmea_lat(lat_e7, lat_str);
     deg_to_nmea_lon(lon_e7, lon_str);

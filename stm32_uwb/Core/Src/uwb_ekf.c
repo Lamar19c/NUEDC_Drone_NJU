@@ -48,7 +48,7 @@
 #include <string.h>   /* memset */
 
 /* ---- 默认调参 (可在 init 后按场地覆盖) ---- */
-#define EKF_Q_ACC_XY_DEFAULT      0.3f    /* 低速平滑优先；快速机动再上调到 1.5~8 */
+#define EKF_Q_ACC_XY_DEFAULT      1.5f    /* 室内慢速默认；激进飞行再上调到 8~16 */
 #define EKF_Q_ACC_Z_DEFAULT       0.5f    /* 垂直几何差，压小 */
 #define EKF_R_RANGE_DEFAULT       0.04f   /* σ_range≈0.2m -> 0.04 m^2 */
 #define EKF_GATE_SQ_DEFAULT       36.0f   /* 6σ 门限，放宽避免初始收敛时拒测 */

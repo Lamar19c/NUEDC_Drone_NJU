@@ -73,6 +73,9 @@ static struct NMEA_Generator  nmea;
 /* ---- 固定高度：UWB 只解水平，z 交给此常值(或下视测距仪) ---- */
 #define FIXED_HEIGHT_M  1.6f
 
+/* ---- 高速屏蔽：超过此速度(m/s)时冻结位置，抑制快速时轨迹膨胀 ---- */
+#define SPEED_FREEZE_HIGH_THRESHOLD  1.5f
+
 /* ---- position cache ---- */
 static float gx = 0.0f, gy = 0.0f, gz = FIXED_HEIGHT_M;
 static float gvx = 0.0f, gvy = 0.0f;
@@ -278,7 +281,12 @@ int main(void)
         /* 发散防护：坏几何/soft-float 下万一出 NaN/Inf，复位重收敛，
            绝不让乱码污染 NMEA(否则飞控会收到 nan 经纬度)。 */
         if (isfinite(x) && isfinite(y) && isfinite(z)) {
-            gx = x; gy = y; gz = z; gvx = vx; gvy = vy;
+            /* 高速屏蔽：超过阈值时不更新位置，抑制快速时轨迹膨胀 */
+            float spd = sqrtf(vx * vx + vy * vy);
+            if (spd < SPEED_FREEZE_HIGH_THRESHOLD) {
+                gx = x; gy = y; gz = z;
+            }
+            gvx = vx; gvy = vy;
             has_pos = 1;
             if (applied > 0) { loop_count++; stat_solve_ok++; }
 

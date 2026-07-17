@@ -67,6 +67,7 @@ static const float ANCHOR_POSITIONS[ANCHOR_COUNT][3] = {
 #define NMEA_RATE_HZ     5.0f
 #define NMEA_HDOP        1.5f        /* HDOP 水平精度因子 (u-blox 典型 1.0~2.0) */
 #define NMEA_SATELLITES  10          /* 可见卫星数 (u-blox 典型 8~16) */
+#define HEADING_OFFSET_DEG 20.0f     /* UWB坐标框架偏角: Y轴=20°(北偏东20°), X轴=110° */
 
 /* ========================================================================
  * 6. 主循环

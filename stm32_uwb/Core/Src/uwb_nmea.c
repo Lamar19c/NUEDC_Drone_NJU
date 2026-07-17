@@ -207,7 +207,9 @@ void nmea_gen_generate(struct NMEA_Generator *n,
     float speed_kn = sqrtf(vx * vx + vy * vy) * 1.94384f;
     float speed_kmh = speed_kn * 1.852f;
     float course = atan2f(vx, vy) * RAD_TO_DEG;
+    course += HEADING_OFFSET_DEG;   /* UWB坐标框架偏角修正 */
     if (course < 0.0f) course += 360.0f;
+    if (course >= 360.0f) course -= 360.0f;
 
     /* Format float values with integer method */
     float alt_m = (float)alt_mm / 1000.0f;

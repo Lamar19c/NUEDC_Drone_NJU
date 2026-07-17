@@ -1,7 +1,7 @@
 /**
  * uwb_nmea.h — NMEA 0183 GPS 语句生成器
  *
- * UWB 局部坐标 → GPS(E7) → NMEA ddmm.mmmm → $GPGGA + $GPRMC + $GPVTG + $GPGSA
+ * UWB 局部坐标 → GPS(E7) → NMEA ddmm.mmmm → $GPGGA + $GPRMC + $GPVTG
  * 从 uwb_arduino/uwb_nmea.h 改写 — C++ class → C struct + .c
  *
  * v2: 所有 snprintf 使用 %d 整数格式，不依赖 newlib-nano 浮点 printf 支持。

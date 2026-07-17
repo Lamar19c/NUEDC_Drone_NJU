@@ -179,6 +179,17 @@ void nmea_gen_generate(struct NMEA_Generator *n,
     sats = 10;
     if (hdop < 0.1f) hdop = 0.1f;
     char status = 'A';
+
+    /* 坐标框架旋转：UWB Y轴指向 HEADING_OFFSET_DEG，X轴指向 HEADING_OFFSET_DEG+90°
+     * 将 UWB 系 (x,y) 旋转到真北-东坐标系后再转 GPS。速度也同步旋转。 */
+    float sin_h = sinf(HEADING_OFFSET_DEG * DEG_TO_RAD);
+    float cos_h = cosf(HEADING_OFFSET_DEG * DEG_TO_RAD);
+    float x_en =  x * cos_h + y * sin_h;   /* true east  */
+    float y_en = -x * sin_h + y * cos_h;   /* true north */
+    float vx_en =  vx * cos_h + vy * sin_h;
+    float vy_en = -vx * sin_h + vy * cos_h;
+    x = x_en; y = y_en; vx = vx_en; vy = vy_en;
+
     /* Step 1: UWB → GPS (E7) */
     int32_t lat_e7, lon_e7, alt_mm;
     local_to_gps(x, y, z, origin_lat, origin_lon, origin_alt, &lat_e7, &lon_e7, &alt_mm);
@@ -206,10 +217,8 @@ void nmea_gen_generate(struct NMEA_Generator *n,
     /* Step 5: Speed + course */
     float speed_kn = sqrtf(vx * vx + vy * vy) * 1.94384f;
     float speed_kmh = speed_kn * 1.852f;
-    float course = atan2f(vx, vy) * RAD_TO_DEG;
-    course += HEADING_OFFSET_DEG;   /* UWB坐标框架偏角修正 */
+    float course = atan2f(vx, vy) * RAD_TO_DEG;  /* vx,vy already rotated to true EN */
     if (course < 0.0f) course += 360.0f;
-    if (course >= 360.0f) course -= 360.0f;
 
     /* Format float values with integer method */
     float alt_m = (float)alt_mm / 1000.0f;

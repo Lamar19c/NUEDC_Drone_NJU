@@ -127,7 +127,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     }
 }
 
-/* ---- USART3 TX complete callback (DMA chain: GGA → RMC → VTG) ---- */
+/* ---- USART3 TX complete callback (DMA chain: GGA → RMC → VTG → GSA) ---- */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART3) {
         switch (nmea_tx_state) {

@@ -28,7 +28,7 @@ static const float ANCHOR_POSITIONS[ANCHOR_COUNT][3] = {
  * 2. 求解器参数
  * ======================================================================== */
 
-#define DEFAULT_HEIGHT   1.0f
+#define DEFAULT_HEIGHT   1.6f
 #define POS_CLAMP_MIN   -10.0f
 #define POS_CLAMP_MAX    10.0f
 #define RESIDUAL_MAX_3D  2.5f      /* 放宽残差，提升低速解算成功率 */

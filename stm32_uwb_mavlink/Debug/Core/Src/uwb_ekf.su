@@ -1,0 +1,9 @@
+../Core/Src/uwb_ekf.c:63:6:uwb_ekf_init	48	static
+../Core/Src/uwb_ekf.c:89:6:uwb_ekf_set_fixed_z	24	static
+../Core/Src/uwb_ekf.c:102:6:uwb_ekf_update_height	16	static
+../Core/Src/uwb_ekf.c:107:13:ekf_predict	88	static
+../Core/Src/uwb_ekf.c:145:12:ekf_update_range	192	static
+../Core/Src/uwb_ekf.c:194:5:uwb_ekf_step	120	static
+../Core/Src/uwb_ekf.c:259:6:uwb_ekf_get	40	static
+../Core/Src/uwb_ekf.c:273:5:uwb_ekf_online_anchors	24	static
+../Core/Src/uwb_ekf.c:282:6:uwb_ekf_health	48	static

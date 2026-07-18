@@ -14,6 +14,10 @@
 
 #include <stdint.h>
 
+/* Forward-declare HAL UART handle (avoid pulling in full HAL in header) */
+struct __UART_HandleTypeDef;
+typedef struct __UART_HandleTypeDef UART_HandleTypeDef;
+
 /* ---- System IDs ---- */
 #define MAVLINK_SYSID          1
 #define MAVLINK_COMPID         191    /* MAV_COMP_ID_VISUAL_INERTIAL_ODOMETRY */

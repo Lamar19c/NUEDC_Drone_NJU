@@ -56,7 +56,6 @@ static uint16_t crc16_buffer(const uint8_t *buf, int len) {
 /* ---- Packing helpers (little-endian, native on Cortex-M3) ---- */
 
 static void _put_u8(uint8_t *buf, int *pos, uint8_t v)  { buf[(*pos)++] = v; }
-static void _put_u16(uint8_t *buf, int *pos, uint16_t v) { memcpy(&buf[*pos], &v, 2); *pos += 2; }
 static void _put_u32(uint8_t *buf, int *pos, uint32_t v) { memcpy(&buf[*pos], &v, 4); *pos += 4; }
 static void _put_u64(uint8_t *buf, int *pos, uint64_t v) { memcpy(&buf[*pos], &v, 8); *pos += 8; }
 static void _put_f32(uint8_t *buf, int *pos, float v)    { memcpy(&buf[*pos], &v, 4); *pos += 4; }
@@ -64,7 +63,6 @@ static void _put_f32(uint8_t *buf, int *pos, float v)    { memcpy(&buf[*pos], &v
 /* ---- Internal state ---- */
 static UART_HandleTypeDef *g_mav_huart = NULL;
 static uint8_t  g_seq  = 0;         /* rolling sequence number */
-static uint8_t  g_txbuf[64];        /* max payload in this build is 32 bytes */
 static uint32_t g_last_tx_ms = 0;
 
 /* ---- Initialise ---- */

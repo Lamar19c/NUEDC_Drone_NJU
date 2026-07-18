@@ -7,6 +7,7 @@
 1. [STM32 端：UWB 解算](#1-stm32-端uwb-解算)
 2. [STM32 → 飞控通信：MAVLink v1](#2-stm32--飞控通信mavlink-v1)
 3. [飞控端：ArduPilot 参数配置](#3-飞控端ardupilot-参数配置)
+   - 3.6 [飞控 EK3 如何融合 VPE 数据](#36-飞控-ek3-如何融合-vpe-数据)
 4. [部署清单](#4-部署清单)
 5. [排错指南](#5-排错指南)
 
@@ -185,6 +186,93 @@ EKF3:
 ```
 [0] x=2.51 y=2.47 z=1.58  vx=0.00 vy=0.00 vz=0.00  fix=1 anc=4 hdop=0.85
   MAVLink VPE: x=2.47 y=2.51 z=-1.58 hdg=0.0
+```
+
+### 3.6 飞控 EK3 如何融合 VPE 数据
+
+#### 3.6.1 数据流
+
+```
+MAVLink VPE  ──→ 飞控 TELEM1 串口 ──→ MAVLink 解析器 ──→ 视觉前端 ──→ EK3 核心
+                                                              ↑
+                                                       AP_VisualOdom
+```
+
+#### 3.6.2 Step 1: MAVLink 解析
+
+飞控收到二进制帧，按 msg_id=102 识别为 VISION_POSITION_ESTIMATE：
+
+```cpp
+// ardupilot/libraries/AP_VisualOdom/AP_VisualOdom_MAV.cpp
+case MAVLINK_MSG_ID_VISION_POSITION_ESTIMATE:
+    pos = {msg.x, msg.y, msg.z}          // NED 坐标 (m), 来自 STM32
+    ang = {msg.roll, msg.pitch, msg.yaw} // 姿态 (rad), roll/pitch=0
+    timestamp = msg.usec                 // 时间戳 (μs)
+```
+
+存入 `AP_VisualOdom` 前端 buffer，供 EK3 消费。
+
+#### 3.6.3 Step 2: 时间对齐与延迟补偿
+
+```
+VPE 时间戳 (usec)  vs  飞控内部时钟
+        ↓
+  EK3 计算 dt = now - timestamp
+  如果 dt > VISO_DELAY_MS + 容差 → 拒融合
+```
+
+STM32 发的 `usec = HAL_GetTick() * 1000` 是上电毫秒，和飞控时钟不同步。飞控用自有的 `AP_HAL::micros()` 接收时刻替代，`VISO_DELAY_MS` 补偿传输和处理延迟。
+
+#### 3.6.4 Step 3: EK3 核心融合
+
+EK3 是 24 状态扩展卡尔曼滤波器。视觉位置更新流程：
+
+```cpp
+// 1. 计算 innovation (观测残差)
+innov_pos = VPE_xyz - EKF_predicted_xyz
+
+// 2. 计算 innovation 协方差
+S = H * P * H^T + R_viso
+// R_viso 来源: VISO_POS_X, VISO_POS_Y, VISO_POS_Z 参数
+
+// 3. 卡方检验 (gate)
+if innov² / S > GATE → 拒融合 (外点, 默认 gate=3σ)
+
+// 4. 计算 Kalman 增益
+K = P * H^T * S^(-1)
+
+// 5. 状态修正
+x_new = x_pred + K * innov
+P_new = (I - K*H) * P
+```
+
+#### 3.6.5 关键参数如何影响融合
+
+| 参数 | 作用 | 调小 | 调大 |
+|------|------|------|------|
+| `VISO_POS_X/Y` | 视觉位置噪声 σ | EKF 更信 VPE → 响应快但可能抖 | 更信惯性 → 平滑但滞后 |
+| `VISO_DELAY_MS` | 视觉延迟补偿 | 时间戳更紧，融合窗口窄 | 容错大但实时性差 |
+| `EK3_SRC1_POSXY` | 位置源选择 | — | 设 6=ExternalNav 是关键 |
+
+#### 3.6.6 与 NMEA GPS 方案对比
+
+| | NMEA 方式 | MAVLink VPE 方式 |
+|------|----------|------------------|
+| 数据格式 | 文本 4 位分 (~18.5cm 量化) | **二进制 float32 (0 量化损失)** |
+| EKF 入口 | GPS 前端 → EK3 GPS 更新 | **视觉前端 → EK3 视觉更新** |
+| 噪声模型 | GPS 噪声 (速度相关) | `VISO_POS_X/Y` 固定 |
+| 坐标转换 | UWB→E7→LatLng→ECEF→NED | **UWB 直接 → NED** (0 中间步骤) |
+| 时间同步 | NMEA 无时间戳 | VPE 带 usec 时间戳 |
+| 航向 | 速度差分 atan2 | **直接融合 yaw** |
+
+#### 3.6.7 精度损失链条
+
+```
+NMEA:  UWB(m) → float32 E7 → int32 E7 → ASCII 4位分 → 飞控解析 float64 → rad → ECEF → NED
+        ↑ 每一步都有精度损失，4位分量化 ~18.5cm 是最差一环
+
+VPE:   UWB(m) → float32 → 飞控 EK3 直接使用
+        ↑ 零中间转换，零额外量化损失
 ```
 
 ---

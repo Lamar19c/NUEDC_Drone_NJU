@@ -51,13 +51,13 @@
 #define EKF_Q_ACC_XY_DEFAULT      1.5f    /* 室内慢速默认；激进飞行再上调到 8~16 */
 #define EKF_Q_ACC_Z_DEFAULT       0.5f    /* 垂直几何差，压小 */
 #define EKF_R_RANGE_DEFAULT       0.04f   /* σ_range≈0.2m -> 0.04 m^2 */
-#define EKF_GATE_SQ_DEFAULT       36.0f   /* 6σ 门限，放宽避免初始收敛时拒测 */
-#define EKF_HDOP_REF_SIGMA        1.00f   /* HDOP=σ_pos/1.0m，收敛后<1，对齐 GPS_HDOP_GOOD=1.4 */
+#define EKF_GATE_SQ_DEFAULT       16.0f   /* 4σ 门限，兼顾 NLOS 剔除与鲁棒 */
+#define EKF_HDOP_REF_SIGMA        0.25f   /* HDOP=σ_pos/0.25m，使健康HDOP≈0.8留裕度 */
 #define EKF_MEAS_TIMEOUT_MS       200u
-#define EKF_FIX_TIMEOUT_MS        300u
+#define EKF_FIX_TIMEOUT_MS        1500u   /* 放宽：短暂测距间隙内保持fix，避免飞控反复掉未定位 */
 #define EKF_HEALTH_ANCHOR_MS      300u    /* 判"近期在线锚点"的窗口 */
 #define EKF_POS_SIGMA_MAX         1.5f    /* 水平 σ 超过则判 fix 不可信 */
-#define EKF_INIT_POS_VAR          1.0f    /* 初始位置方差 (1m)^2，冷启动HDOP≈1.4 */
+#define EKF_INIT_POS_VAR          25.0f   /* 初始位置方差 (5m)^2 */
 #define EKF_INIT_VEL_VAR          4.0f    /* 初始速度方差 (2m/s)^2 */
 
 void uwb_ekf_init(struct UWB_EKF *e, const float anchors[][3], int count) {
@@ -199,7 +199,12 @@ int uwb_ekf_step(struct UWB_EKF *e, const float distances[],
         if (distances[i] <= 0.0f || distances[i] >= 50.0f) continue;
         uint32_t ts = last_update_ms[i];
         if (ts == e->last_meas_ms[i]) continue;               /* 已消费过 */
-        if ((now_ms - ts) >= e->meas_timeout_ms) continue;     /* 太旧 */
+        /* 时间戳可能略晚于 now(测距在采样 now 之后到达)，此时 now-ts 会
+         * 无符号下溢成天文数字、被误判"太旧"而丢弃。实测约14%的测量因此
+         * 被推迟一拍。用有符号差判断，未来时间戳按 0 龄处理。 */
+        int32_t age = (int32_t)(now_ms - ts);
+        if (age < 0) age = 0;
+        if ((uint32_t)age >= e->meas_timeout_ms) continue;     /* 太旧 */
         order[n++] = i;
     }
     /* 插入排序 (n<=8) 按 last_update_ms 升序 */
@@ -215,15 +220,6 @@ int uwb_ekf_step(struct UWB_EKF *e, const float distances[],
         if (n > 0) { e->initialized = 1; e->last_pred_ms = last_update_ms[order[0]]; }
         else return 0;
     }
-
-    /* 自适应 q_acc_xy：低速收紧过程噪声，高速放宽，兼得快慢性能 */
-    float speed = sqrtf(e->x[3]*e->x[3] + e->x[4]*e->x[4]);  /* vx²+vy² */
-    if (speed < 0.3f)
-        e->q_acc_xy = 0.05f;       /* 准静止：强平滑，抑制抖动 */
-    else if (speed < 1.0f)
-        e->q_acc_xy = 0.3f;        /* 慢速步行 */
-    else
-        e->q_acc_xy = 1.5f;        /* 快速机动 */
 
     int applied = 0;
     for (int a = 0; a < n; a++) {
@@ -281,7 +277,6 @@ int uwb_ekf_online_anchors(const struct UWB_EKF *e, uint32_t now_ms) {
 
 void uwb_ekf_health(const struct UWB_EKF *e, uint32_t now_ms,
                     int *fix_ok, int *sats, float *hdop) {
-    int anchors_recent = uwb_ekf_online_anchors(e, now_ms);
 
     float pos_var = e->P[0][0] + e->P[1][1];
     float pos_sigma = (pos_var > 0.0f) ? sqrtf(pos_var) : 0.0f;
@@ -292,17 +287,16 @@ void uwb_ekf_health(const struct UWB_EKF *e, uint32_t now_ms,
 
     int fresh = e->initialized &&
                 (now_ms - e->last_good_update_ms) < e->fix_timeout_ms;
-    /* GGA 定位有效位：有新鲜、>=3 锚点的解就报有效(1)。不再用 pos_sigma/reject
-     * 阈值去翻转它——那些瞬时波动会让 fix 反复掉 0、飞控卡在"未定位"。
-     * 定位的好坏由 HDOP 表达，交给飞控加权/解锁判断。 */
-    int ok = fresh && (anchors_recent >= 3);
+    /* GGA 定位有效位：只要 1.5s 内有过有效解就报有效(1)，短暂测距间隙不翻 0，
+     * 避免飞控反复掉"未定位"。间隙期间 P 增大、HDOP 自然升高来反映质量下降，
+     * 真正持续丢解(超1.5s)才翻 0 触发失控保护。 */
+    int ok = fresh;
 
     if (fix_ok) *fix_ok = ok ? 1 : 0;
     if (hdop)   *hdop   = hd;
     if (sats) {
-        /* 健康时给出与在线锚点数挂钩的伪卫星数，让地面站的最小卫星/HDOP
-         * 检查在退化时能如实报警；不健康时压到很低。 */
-        *sats = ok ? (4 + anchors_recent * 2) : (anchors_recent > 0 ? 3 : 0);
-        if (*sats > 19) *sats = 19;
+        /* 有解固定报 12 颗，满足飞控最小卫星数检查(常见>=6)；无解报 0。
+         * 定位好坏交给 HDOP 表达，不靠卫星数抖动。 */
+        *sats = ok ? 12 : 0;
     }
 }

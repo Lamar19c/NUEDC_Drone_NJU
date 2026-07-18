@@ -314,6 +314,26 @@ int main(void)
                    (long)(lat_e7 / 10000000),   labs(lat_e7 % 10000000),
                    (long)(lon_e7 / 10000000),   labs(lon_e7 % 10000000),
                    (long)(alt_mm / 1000),       labs(alt_mm % 1000));
+
+            /* ===== 全链路诊断行(约每3帧一次，采圈测试用) =====
+             * DBG t | d= 原始距离cm | age= 各锚点数据年龄ms(看时间偏斜)
+             *      | ekf= EKF原始xy(cm,未量化) | v= 速度cm/s | e7= 量化前经纬度
+             * 采完用脚本对比: EKF原始xy 是否随速度变大小(EKF层)，
+             * 以及 e7 按4位量化回本地后 与 EKF原始xy 的差(量化层)。 */
+            static uint32_t dbg_cnt = 0;
+            if (++dbg_cnt % 3 == 0) {
+                printf("DBG t=%lu d=%d,%d,%d,%d age=%lu,%lu,%lu,%lu "
+                       "ekf=%d,%d v=%d,%d e7=%ld,%ld\r\n",
+                       (unsigned long)now,
+                       (int)(distances[0] * 100.0f), (int)(distances[1] * 100.0f),
+                       (int)(distances[2] * 100.0f), (int)(distances[3] * 100.0f),
+                       (unsigned long)(now - parser.last_update_ms[0]),
+                       (unsigned long)(now - parser.last_update_ms[1]),
+                       (unsigned long)(now - parser.last_update_ms[2]),
+                       (unsigned long)(now - parser.last_update_ms[3]),
+                       xi, yi, vxi, vyi,
+                       (long)lat_e7, (long)lon_e7);
+            }
         } else {
             uwb_ekf_init(&ekf, ANCHOR_POSITIONS, ANCHOR_COUNT);
             uwb_ekf_set_fixed_z(&ekf, FIXED_HEIGHT_M);   /* 复位重收敛 */

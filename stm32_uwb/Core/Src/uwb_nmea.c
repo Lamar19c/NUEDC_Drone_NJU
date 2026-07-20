@@ -179,6 +179,15 @@ void nmea_gen_generate(struct NMEA_Generator *n,
     if (sats < 0) sats = 0;
     if (hdop < 0.1f) hdop = 0.1f;
     char status = (fix_quality > 0) ? 'A' : 'V';
+
+    /* UWB 坐标旋转到真北: sin12=0.20791169, cos12=0.97814760 */
+    const float sin12 = 0.20791169f, cos12 = 0.97814760f;
+    float x_en =  x * cos12 + y * sin12;
+    float y_en = -x * sin12 + y * cos12;
+    float vx_en =  vx * cos12 + vy * sin12;
+    float vy_en = -vx * sin12 + vy * cos12;
+    x = x_en; y = y_en; vx = vx_en; vy = vy_en;
+
     /* Step 1: UWB → GPS (E7) */
     int32_t lat_e7, lon_e7, alt_mm;
     local_to_gps(x, y, z, origin_lat, origin_lon, origin_alt, &lat_e7, &lon_e7, &alt_mm);

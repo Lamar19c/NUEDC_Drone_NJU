@@ -64,13 +64,145 @@ body { background: var(--bg); color: var(--text); height: 100vh; overflow: hidde
 .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 3px; }
 .status-dot.on { background: var(--success); }
 .status-dot.off { background: var(--danger); }
+
+/* Compact Raspberry Pi controls stay dormant on desktop. */
+#compact-controls, #drawer-backdrop, .compact-drawer-close { display: none; }
+
+@media (max-width: 700px) {
+  body { height: 100vh; height: 100dvh; }
+  #app {
+    position: relative;
+    width: 100%;
+    height: 100vh;
+    height: 100dvh;
+    padding-bottom: 48px;
+  }
+  #center-panel { width: 100%; }
+  #map-container { min-height: 0; }
+
+  #telemetry-bar {
+    order: -1;
+    height: 34px;
+    min-height: 34px;
+    gap: 3px;
+    padding: 3px 5px;
+    flex-wrap: nowrap;
+    overflow: hidden;
+    border-top: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .telem-item {
+    min-width: 0;
+    padding: 3px 5px;
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .compact-hide { display: none; }
+
+  #left-panel, #right-panel {
+    position: fixed;
+    top: 0;
+    bottom: 48px;
+    z-index: 1200;
+    width: min(78vw, 320px);
+    min-width: 0;
+    max-width: 320px;
+    overflow-y: auto;
+    box-shadow: 8px 0 24px rgba(0, 0, 0, 0.45);
+    transform: translateX(-105%);
+    transition: transform 160ms ease;
+    overscroll-behavior: contain;
+  }
+  #right-panel {
+    left: auto;
+    right: 0;
+    border-right: 0;
+    border-left: 1px solid var(--border);
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.45);
+    transform: translateX(105%);
+  }
+  #left-panel.drawer-open, #right-panel.drawer-open { transform: translateX(0); }
+  .compact-drawer-close {
+    display: block;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    width: 100%;
+    min-height: 40px;
+    padding: 8px 12px;
+    color: var(--text);
+    background: #181b20;
+    border: 0;
+    border-bottom: 1px solid var(--border);
+    text-align: right;
+    font-size: 12px;
+  }
+  .section select, .section input, .section .btn { min-height: 40px; }
+  #right-panel .section[style] { overflow: visible !important; flex: none !important; }
+  #right-panel #wp-table { min-width: 272px; }
+
+  #drawer-backdrop {
+    position: fixed;
+    inset: 0 0 48px;
+    z-index: 1100;
+    width: 100%;
+    border: 0;
+    background: rgba(0, 0, 0, 0.5);
+  }
+  #drawer-backdrop.drawer-open { display: block; }
+
+  #compact-controls {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 3px;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 1300;
+    height: 48px;
+    padding: 3px;
+    background: #181b20;
+    border-top: 1px solid var(--border);
+  }
+  #compact-controls button {
+    min-width: 0;
+    min-height: 42px;
+    padding: 4px 2px;
+    color: var(--text);
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-size: 12px;
+    font-weight: 600;
+    touch-action: manipulation;
+  }
+  #compact-controls .compact-primary {
+    color: #fff;
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  #compact-controls .compact-danger {
+    color: #fff;
+    background: var(--danger);
+    border-color: var(--danger);
+  }
+
+  #btn-follow { min-height: 36px; padding: 6px 10px !important; }
+}
+
+@media (max-width: 700px) and (prefers-reduced-motion: reduce) {
+  #left-panel, #right-panel { transition: none; }
+}
 </style>
 </head>
 <body>
 
 <div id="app">
   <!-- LEFT PANEL -->
-  <div id="left-panel" class="panel">
+  <div id="left-panel" class="panel compact-drawer" aria-label="连接与飞行控制">
+    <button type="button" class="compact-drawer-close" aria-label="关闭控制面板">关闭 ×</button>
     <h3>连接配置</h3>
     <div class="section" id="conn-section">
       <div class="radio-group" id="conn-type-group">
@@ -142,17 +274,18 @@ body { background: var(--bg); color: var(--text); height: 100vh; overflow: hidde
     <div id="telemetry-bar">
       <div class="telem-item">&#x1F4CF; 高度 <span class="val" id="t-alt">--</span>m</div>
       <div class="telem-item">&#x26A1; 速度 <span class="val" id="t-speed">--</span>m/s</div>
-      <div class="telem-item">&#x1F9ED; 航向 <span class="val" id="t-heading">--</span>&deg;</div>
+      <div class="telem-item compact-hide">&#x1F9ED; 航向 <span class="val" id="t-heading">--</span>&deg;</div>
       <div class="telem-item"><span class="status-dot off" id="t-mode-dot"></span> <span class="val" id="t-mode">--</span></div>
-      <div class="telem-item">&#x1F50B; <span class="val" id="t-bat">--</span>V <span class="val" id="t-batpct">--</span>%</div>
-      <div class="telem-item" id="t-gps-item">&#x1F6F0; <span class="val" id="t-sats">--</span> | HDOP <span class="val" id="t-hdop">--</span></div>
-      <div class="telem-item">&#x1F4CD; <span class="val" id="t-pos">--</span></div>
+      <div class="telem-item">&#x1F50B; <span class="compact-hide"><span class="val" id="t-bat">--</span>V </span><span class="val" id="t-batpct">--</span>%</div>
+      <div class="telem-item" id="t-gps-item">&#x1F6F0; <span class="val" id="t-sats">--</span><span class="compact-hide"> | HDOP <span class="val" id="t-hdop">--</span></span></div>
+      <div class="telem-item compact-hide">&#x1F4CD; <span class="val" id="t-pos">--</span></div>
       <div class="telem-item">&#x1F3AF; <span class="val" id="t-target">--</span></div>
     </div>
   </div>
 
   <!-- RIGHT PANEL -->
-  <div id="right-panel" class="panel">
+  <div id="right-panel" class="panel compact-drawer" aria-label="航点与任务控制">
+    <button type="button" class="compact-drawer-close" aria-label="关闭航点面板">关闭 ×</button>
     <h3>航点列表</h3>
     <div class="section" style="overflow-y:auto;flex:1;">
       <table id="wp-table">
@@ -179,6 +312,15 @@ body { background: var(--bg); color: var(--text); height: 100vh; overflow: hidde
     </div>
   </div>
 </div>
+
+<button id="drawer-backdrop" type="button" aria-label="关闭侧边面板"></button>
+<nav id="compact-controls" aria-label="飞行快捷控制">
+  <button id="compact-open-controls" type="button" aria-controls="left-panel" aria-expanded="false">控制</button>
+  <button id="compact-arm" type="button">解锁</button>
+  <button id="compact-takeoff" class="compact-primary" type="button">起飞</button>
+  <button id="compact-land" class="compact-danger" type="button">降落</button>
+  <button id="compact-open-waypoints" type="button" aria-controls="right-panel" aria-expanded="false">航点</button>
+</nav>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
@@ -325,7 +467,8 @@ function logStatus(msg, level) {
   level = level || "info";
   var el = document.getElementById("mission-status");
   var colors = { info: "var(--accent)", warn: "var(--warn)", error: "var(--danger)" };
-  el.innerHTML = "<span style=\"color:" + (colors[level] || colors.info) + "\">" + msg + "</span>";
+  el.style.color = colors[level] || colors.info;
+  el.textContent = String(msg);
   console.log("[GCS] " + msg);
 }
 
@@ -909,7 +1052,7 @@ document.getElementById("btn-upload").onclick = function() {
   var wpts = getWaypointsFromTable();
   if (wpts.length === 0) { logStatus("没有航点", "warn"); return; }
   wsSend("upload_mission", { waypoints: wpts });
-  logStatus("已上传 " + wpts.length + " 个航点", "info");
+  logStatus("正在上传 " + wpts.length + " 个航点，等待飞控确认...", "info");
 };
 
 document.getElementById("btn-mission-start").onclick = function() {
@@ -974,10 +1117,6 @@ function handleMessage(msg) {
   } else if (msg.type === "telemetry") {
     updateTelemetry(msg);
   } else if (msg.type === "status") {
-    if (msg.level === "error") {
-      mavConnected = false;
-      updateConnUI(wsConnected);
-    }
     logStatus(msg.msg, msg.level || "info");
   } else if (msg.type === "mission_progress") {
     document.getElementById("t-target").textContent = "WP" + (msg.seq + 1) + "/" + msg.total;
@@ -994,8 +1133,84 @@ function handleMessage(msg) {
   }
 }
 
+// ============== Compact layout ==============
+var compactDrawer = null;
+var compactMedia = window.matchMedia("(max-width: 700px)");
+
+function compactLayoutActive() {
+  return compactMedia.matches;
+}
+
+function refreshResponsiveMap() {
+  window.setTimeout(function() {
+    redrawNEDCanvas();
+    if (leafletMap) leafletMap.invalidateSize();
+  }, 180);
+}
+
+function closeCompactDrawers() {
+  ["left-panel", "right-panel"].forEach(function(id) {
+    document.getElementById(id).classList.remove("drawer-open");
+  });
+  document.getElementById("drawer-backdrop").classList.remove("drawer-open");
+  document.getElementById("compact-open-controls").setAttribute("aria-expanded", "false");
+  document.getElementById("compact-open-waypoints").setAttribute("aria-expanded", "false");
+  compactDrawer = null;
+  refreshResponsiveMap();
+}
+
+function openCompactDrawer(panelId, triggerId) {
+  if (!compactLayoutActive()) return;
+  if (compactDrawer === panelId) {
+    closeCompactDrawers();
+    return;
+  }
+  ["left-panel", "right-panel"].forEach(function(id) {
+    document.getElementById(id).classList.toggle("drawer-open", id === panelId);
+  });
+  document.getElementById("drawer-backdrop").classList.add("drawer-open");
+  document.getElementById("compact-open-controls").setAttribute(
+    "aria-expanded", panelId === "left-panel" ? "true" : "false"
+  );
+  document.getElementById("compact-open-waypoints").setAttribute(
+    "aria-expanded", panelId === "right-panel" ? "true" : "false"
+  );
+  compactDrawer = panelId;
+}
+
+function forwardCompactAction(targetId) {
+  document.getElementById(targetId).click();
+}
+
+document.getElementById("compact-open-controls").onclick = function() {
+  openCompactDrawer("left-panel", "compact-open-controls");
+};
+document.getElementById("compact-open-waypoints").onclick = function() {
+  openCompactDrawer("right-panel", "compact-open-waypoints");
+};
+document.getElementById("compact-arm").onclick = function() {
+  forwardCompactAction("btn-arm");
+};
+document.getElementById("compact-takeoff").onclick = function() {
+  forwardCompactAction("btn-takeoff");
+};
+document.getElementById("compact-land").onclick = function() {
+  forwardCompactAction("btn-land");
+};
+document.getElementById("drawer-backdrop").onclick = closeCompactDrawers;
+document.querySelectorAll(".compact-drawer-close").forEach(function(button) {
+  button.onclick = closeCompactDrawers;
+});
+window.addEventListener("keydown", function(event) {
+  if (event.key === "Escape" && compactDrawer) closeCompactDrawers();
+});
+if (compactMedia.addEventListener) {
+  compactMedia.addEventListener("change", closeCompactDrawers);
+} else {
+  compactMedia.addListener(closeCompactDrawers);
+}
+
 // ============== Init ==============
-window.addEventListener("beforeunload", function() { wsSend("disconnect"); });
 wsConnect();
 
 // Pre-populate 3 demo waypoints

@@ -217,6 +217,19 @@ class GroundStationRegressionTests(unittest.TestCase):
         self.assertIn('id="compact-open-waypoints"', html)
         self.assertIn('aria-expanded="false"', html)
 
+    def test_medium_layout_contract_is_present(self):
+        html = self.html_source()
+        marker = "@media (min-width: 701px) and (max-width: 1100px)"
+        self.assertIn(marker, html)
+        start = html.index(marker)
+        end = html.index("@media (max-width: 700px)", start)
+        medium_css = html[start:end]
+        self.assertIn("#left-panel, #right-panel", medium_css)
+        self.assertIn("width: 220px", medium_css)
+        self.assertIn("min-width: 220px", medium_css)
+        self.assertIn("overflow-y: auto", medium_css)
+        self.assertIn("overscroll-behavior: contain", medium_css)
+
     def test_desktop_panel_structure_is_preserved(self):
         html = self.html_source()
         self.assertEqual(html.count('id="left-panel"'), 1)
